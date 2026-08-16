@@ -23,7 +23,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GOROUTER_API_KEY = os.getenv("GOROUTER_API_KEY", "")
 GOROUTER_BASE_URL = os.getenv("GOROUTER_BASE_URL", "https://gorouter.app/v1")
 PORT = int(os.getenv("PORT", "8080"))
-WEBAPP_URL = os.getenv("WEBAPP_URL", f"http://localhost:{PORT}")
+WEBAPP_URL = os.getenv("WEBAPP_URL", f"https://bot-production-57e1.up.railway.app")
 
 MODELS = [
     {"id": "claude-opus-5", "name": "Claude Opus 5"},
