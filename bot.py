@@ -1,846 +1,479 @@
-import os
-import sys
-import json
-import base64
-import io
-import zipfile
-import logging
 import asyncio
-from typing import List, Dict, Any
-
-from aiohttp import web
-from dotenv import load_dotenv
-from openai import AsyncOpenAI
-
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
-
-load_dotenv()
-
-# Configuration from Environment
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-GOROUTER_API_KEY = os.getenv("GOROUTER_API_KEY", "")
-GOROUTER_BASE_URL = os.getenv("GOROUTER_BASE_URL", "https://gorouter.app/v1")
-PORT = int(os.getenv("PORT", "8080"))
-WEBAPP_URL = os.getenv("WEBAPP_URL", f"https://bot-production-57e1.up.railway.app")
-
-MODELS = [
-    {"id": "claude-opus-5", "name": "Claude Opus 5"},
-    {"id": "claude-opus-5-thinking", "name": "Claude Opus 5 Thinking"},
-    {"id": "claude-opus-4-8", "name": "Claude Opus 4.8"},
-    {"id": "claude-opus-4-8-thinking", "name": "Claude Opus 4.8 Thinking"},
-]
-
-client = AsyncOpenAI(
-    api_key=GOROUTER_API_KEY,
-    base_url=GOROUTER_BASE_URL,
+import logging
+import time
+import os
+import random
+from aiogram import Bot, Dispatcher, types, F, html
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    InlineKeyboardButton, InlineKeyboardMarkup,
+    InputMediaPhoto, InputMediaVideo,
+    ReplyKeyboardMarkup, KeyboardButton
 )
+from aiogram.enums import PollType
+from aiogram.exceptions import TelegramBadRequest
+
+# Токен теперь берётся из переменной окружения BOT_TOKEN
+BOT_TOKEN = os.getenv("BOT_TOKZ")
+if not BOT_TOKEN:
+    logging.error("BOT_TOKEN не установлен!")
+    exit(1)
+
+CHANNEL_ID = -1003653450767      
+MOD_CHAT_ID = -1004322024985     
+MOD_THREAD_ID = 2
+RULES_LINK = "https://t.me/eblonmiatom"
+COMMENTS_CHAT_ID = -1003415491214 
+
+PUBLISH_INTERVAL = 300 
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+pending_posts = {}
+publish_queue = [] 
+last_publish_time = 0 
+recent_channel_posts = {}
 
-# --- HTML Template with Claude Orange Theme, Dark/Light mode, Chat History & Attachments ---
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="ru" data-theme="dark">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Agent Task</title>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <style>
-    :root {
-      --bg-primary: #181816;
-      --bg-secondary: #22221f;
-      --bg-surface: #2b2b27;
-      --bg-input: #1e1e1b;
-      --text-main: #f3f3ee;
-      --text-muted: #a3a398;
-      --border-color: #383832;
-      --accent: #d97757;
-      --accent-hover: #c15f3e;
-      --user-bubble: #2d2a26;
-      --bot-bubble: #22221f;
-      --font-stack: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    }
+moderator_stats = {}
 
-    [data-theme="light"] {
-      --bg-primary: #fbfaf7;
-      --bg-secondary: #f3f1eb;
-      --bg-surface: #e8e5dc;
-      --bg-input: #ffffff;
-      --text-main: #242422;
-      --text-muted: #73726c;
-      --border-color: #dedbd2;
-      --accent: #d97757;
-      --accent-hover: #c15f3e;
-      --user-bubble: #f1ede4;
-      --bot-bubble: #ffffff;
-    }
+class RegForm(StatesGroup):
+    waiting_name = State()
+    waiting_universe = State()
+    waiting_players = State()
+    waiting_conditions = State()
+    waiting_photo = State()
+    waiting_photo2 = State()
+    waiting_admin_message = State()
 
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-      font-family: var(--font-stack);
-      -webkit-tap-highlight-color: transparent;
-    }
+# ---------- КЛАВИАТУРЫ ----------
 
-    body {
-      background-color: var(--bg-primary);
-      color: var(--text-main);
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
+def get_main_kb(is_admin: bool = False):
+    """Инлайн-клавиатура для выбора типа регистрации с проверкой на админа"""
+    buttons = [
+        [InlineKeyboardButton(text="📝 Мнение ", callback_data="reg_opinion", style="primary")],
+        [InlineKeyboardButton(text="⚔️ ПБ ⚔️", callback_data="reg_pb", style="danger")]
+    ]
+    if is_admin:
+        buttons.append([InlineKeyboardButton(text="📢 Отправить сообщение в канал", callback_data="admin_send_to_channel", style="success")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    /* Header */
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 12px 16px;
-      background: var(--bg-secondary);
-      border-bottom: 1px solid var(--border-color);
-      z-index: 10;
-    }
+def get_confirm_kb():
+    """Инлайн-клавиатура подтверждения"""
+    buttons = [
+        [InlineKeyboardButton(text="На модерацию ✅", callback_data="confirm_send", style="success")],
+        [InlineKeyboardButton(text="Отмена ❌", callback_data="cancel", style="danger")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    .header-left, .header-right {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
+def get_restart_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🤖 Перезапустить")]],
+        resize_keyboard=True
+    )
 
-    .app-title {
-      font-weight: 700;
-      font-size: 1.1rem;
-      color: var(--accent);
-      letter-spacing: -0.3px;
-    }
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 
-    .icon-btn {
-      background: transparent;
-      border: 1px solid var(--border-color);
-      color: var(--text-main);
-      padding: 6px 10px;
-      border-radius: 8px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      font-size: 0.85rem;
-      transition: all 0.2s;
-    }
+async def is_user_admin(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=MOD_CHAT_ID, user_id=user_id)
+        return member.status in ["creator", "administrator", "member"]
+    except Exception:
+        return False
 
-    .icon-btn:hover {
-      background: var(--bg-surface);
-      border-color: var(--accent);
-    }
-
-    /* Sidebar / Drawer */
-    #sidebar {
-      position: fixed;
-      top: 0;
-      left: -280px;
-      width: 280px;
-      height: 100%;
-      background: var(--bg-secondary);
-      border-right: 1px solid var(--border-color);
-      z-index: 100;
-      transition: left 0.3s ease;
-      display: flex;
-      flex-direction: column;
-    }
-
-    #sidebar.open {
-      left: 0;
-    }
-
-    .sidebar-header {
-      padding: 16px;
-      border-bottom: 1px solid var(--border-color);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .sidebar-content {
-      flex: 1;
-      overflow-y: auto;
-      padding: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-
-    .chat-item {
-      padding: 10px 12px;
-      border-radius: 8px;
-      background: var(--bg-primary);
-      border: 1px solid var(--border-color);
-      font-size: 0.85rem;
-      cursor: pointer;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      color: var(--text-main);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .chat-item.active {
-      border-color: var(--accent);
-      font-weight: 600;
-    }
-
-    .overlay {
-      position: fixed;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      background: rgba(0, 0, 0, 0.5);
-      z-index: 90;
-      display: none;
-    }
-
-    .overlay.active {
-      display: block;
-    }
-
-    /* Chat Area */
-    #chat-container {
-      flex: 1;
-      overflow-y: auto;
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-
-    .message {
-      max-width: 88%;
-      padding: 12px 16px;
-      border-radius: 12px;
-      line-height: 1.5;
-      font-size: 0.92rem;
-      word-break: break-word;
-    }
-
-    .message.user {
-      align-self: flex-end;
-      background: var(--user-bubble);
-      border: 1px solid var(--border-color);
-      border-bottom-right-radius: 4px;
-    }
-
-    .message.assistant {
-      align-self: flex-start;
-      background: var(--bot-bubble);
-      border: 1px solid var(--border-color);
-      border-bottom-left-radius: 4px;
-    }
-
-    .message .model-tag {
-      font-size: 0.72rem;
-      color: var(--accent);
-      margin-bottom: 4px;
-      font-weight: 600;
-    }
-
-    .message pre {
-      background: var(--bg-primary);
-      padding: 10px;
-      border-radius: 6px;
-      overflow-x: auto;
-      margin: 8px 0;
-      border: 1px solid var(--border-color);
-    }
-
-    .message code {
-      font-family: monospace;
-      font-size: 0.85rem;
-    }
-
-    .files-badge-container {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-bottom: 8px;
-    }
-
-    .file-badge {
-      font-size: 0.75rem;
-      background: var(--bg-surface);
-      padding: 4px 8px;
-      border-radius: 6px;
-      border: 1px solid var(--border-color);
-      color: var(--text-muted);
-    }
-
-    /* Input Section */
-    .input-section {
-      background: var(--bg-secondary);
-      border-top: 1px solid var(--border-color);
-      padding: 10px 14px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-
-    .attachments-preview {
-      display: flex;
-      gap: 8px;
-      overflow-x: auto;
-      padding-bottom: 4px;
-    }
-
-    .preview-pill {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      background: var(--bg-surface);
-      border: 1px solid var(--border-color);
-      padding: 4px 8px;
-      border-radius: 6px;
-      font-size: 0.78rem;
-    }
-
-    .preview-pill span.remove {
-      color: var(--accent);
-      cursor: pointer;
-      font-weight: bold;
-    }
-
-    .input-row {
-      display: flex;
-      gap: 8px;
-      align-items: flex-end;
-    }
-
-    textarea {
-      flex: 1;
-      background: var(--bg-input);
-      border: 1px solid var(--border-color);
-      color: var(--text-main);
-      padding: 10px 12px;
-      border-radius: 10px;
-      resize: none;
-      height: 44px;
-      max-height: 120px;
-      font-size: 0.95rem;
-      outline: none;
-    }
-
-    textarea:focus {
-      border-color: var(--accent);
-    }
-
-    .action-btn {
-      width: 44px;
-      height: 44px;
-      background: var(--accent);
-      color: #ffffff;
-      border: none;
-      border-radius: 10px;
-      cursor: pointer;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      flex-shrink: 0;
-      transition: background 0.2s;
-    }
-
-    .action-btn:hover {
-      background: var(--accent-hover);
-    }
-
-    .action-btn:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-
-    .attach-btn {
-      width: 44px;
-      height: 44px;
-      background: var(--bg-input);
-      border: 1px solid var(--border-color);
-      color: var(--text-main);
-      border-radius: 10px;
-      cursor: pointer;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      flex-shrink: 0;
-    }
-
-    /* Model Selector */
-    .bottom-controls {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .model-selector {
-      background: var(--bg-input);
-      border: 1px solid var(--border-color);
-      color: var(--text-main);
-      padding: 5px 8px;
-      border-radius: 8px;
-      font-size: 0.8rem;
-      outline: none;
-      cursor: pointer;
-    }
-
-    .model-selector:focus {
-      border-color: var(--accent);
-    }
-
-    #file-input {
-      display: none;
-    }
-  </style>
-</head>
-<body>
-
-  <div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
-
-  <!-- Sidebar: Chat History -->
-  <div id="sidebar">
-    <div class="sidebar-header">
-      <h3 style="font-size:1rem;">История чатов</h3>
-      <button class="icon-btn" onclick="toggleSidebar()">✕</button>
-    </div>
-    <div style="padding: 12px 12px 0;">
-      <button class="icon-btn" style="width:100%; justify-content:center; background: var(--accent); color:#fff; border:none;" onclick="createNewChat()">+ Новый чат</button>
-    </div>
-    <div class="sidebar-content" id="chat-list"></div>
-  </div>
-
-  <!-- Header -->
-  <header>
-    <div class="header-left">
-      <button class="icon-btn" onclick="toggleSidebar()">☰</button>
-      <span class="app-title">Agent Task</span>
-    </div>
-    <div class="header-right">
-      <button class="icon-btn" onclick="toggleTheme()" id="theme-btn">☀️ Тема</button>
-    </div>
-  </header>
-
-  <!-- Chat Content -->
-  <div id="chat-container"></div>
-
-  <!-- Input Section -->
-  <div class="input-section">
-    <div class="attachments-preview" id="attachments-preview"></div>
+@dp.message(F.chat.id == COMMENTS_CHAT_ID, F.is_automatic_forward)
+async def catch_auto_forward(message: types.Message):
+    orig_id = None
+    if message.forward_from_message_id:
+        orig_id = message.forward_from_message_id
+    elif message.forward_origin and hasattr(message.forward_origin, 'message_id'):
+        orig_id = message.forward_origin.message_id
     
-    <div class="input-row">
-      <input type="file" id="file-input" multiple onchange="handleFileSelect(event)" accept="*/*">
-      <button class="attach-btn" onclick="document.getElementById('file-input').click()" title="Прикрепить фото, zip или файлы">📎</button>
-      <textarea id="prompt-input" placeholder="Спросите что-нибудь..." rows="1" oninput="autoResize(this)" onkeydown="handleKeyDown(event)"></textarea>
-      <button class="action-btn" id="send-btn" onclick="sendMessage()">➤</button>
-    </div>
+    if orig_id:
+        recent_channel_posts[orig_id] = message.message_id
 
-    <div class="bottom-controls">
-      <div style="font-size:0.75rem; color:var(--text-muted);">Модель Claude:</div>
-      <select class="model-selector" id="model-select">
-        <option value="claude-opus-5">Claude Opus 5</option>
-        <option value="claude-opus-5-thinking">Claude Opus 5 Thinking</option>
-        <option value="claude-opus-4-8">Claude Opus 4.8</option>
-        <option value="claude-opus-4-8-thinking">Claude Opus 4.8 Thinking</option>
-      </select>
-    </div>
-  </div>
-
-  <script>
-    if (window.Telegram && window.Telegram.WebApp) {
-      window.Telegram.WebApp.ready();
-      window.Telegram.WebApp.expand();
-    }
-
-    let attachedFiles = [];
-    let chats = JSON.parse(localStorage.getItem('agent_task_chats') || '[]');
-    let currentChatId = localStorage.getItem('agent_task_current_chat') || null;
-
-    function init() {
-      if (!chats.length || !currentChatId) {
-        createNewChat();
-      } else {
-        loadChat(currentChatId);
-      }
-      renderChatList();
-    }
-
-    function toggleTheme() {
-      const html = document.documentElement;
-      const nextTheme = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-      html.setAttribute('data-theme', nextTheme);
-      document.getElementById('theme-btn').innerText = nextTheme === 'dark' ? '☀️ Тема' : '🌙 Тема';
-    }
-
-    function toggleSidebar() {
-      document.getElementById('sidebar').classList.toggle('open');
-      document.getElementById('overlay').classList.toggle('active');
-    }
-
-    function createNewChat() {
-      const newId = 'chat_' + Date.now();
-      const newChat = {
-        id: newId,
-        title: 'Новый диалог',
-        messages: []
-      };
-      chats.unshift(newChat);
-      currentChatId = newId;
-      saveChats();
-      renderChatList();
-      loadChat(newId);
-      if (document.getElementById('sidebar').classList.contains('open')) {
-        toggleSidebar();
-      }
-    }
-
-    function loadChat(id) {
-      currentChatId = id;
-      localStorage.setItem('agent_task_current_chat', id);
-      const chat = chats.find(c => c.id === id);
-      const container = document.getElementById('chat-container');
-      container.innerHTML = '';
-
-      if (chat && chat.messages) {
-        chat.messages.forEach(msg => appendMessageUI(msg.role, msg.content, msg.model, msg.files));
-      }
-      renderChatList();
-    }
-
-    function saveChats() {
-      localStorage.setItem('agent_task_chats', JSON.stringify(chats));
-    }
-
-    function renderChatList() {
-      const list = document.getElementById('chat-list');
-      list.innerHTML = '';
-      chats.forEach(c => {
-        const item = document.createElement('div');
-        item.className = 'chat-item' + (c.id === currentChatId ? ' active' : '');
-        item.innerHTML = `<span>${escapeHtml(c.title || 'Чат')}</span><span onclick="deleteChat(event, '${c.id}')" style="color:var(--text-muted); padding-left:8px;">✕</span>`;
-        item.onclick = (e) => {
-          if (e.target.tagName !== 'SPAN' || !e.target.innerText.includes('✕')) {
-            loadChat(c.id);
-            toggleSidebar();
-          }
-        };
-        list.appendChild(item);
-      });
-    }
-
-    function deleteChat(e, id) {
-      e.stopPropagation();
-      chats = chats.filter(c => c.id !== id);
-      if (currentChatId === id) {
-        currentChatId = chats.length ? chats[0].id : null;
-      }
-      saveChats();
-      if (!chats.length) {
-        createNewChat();
-      } else {
-        loadChat(currentChatId);
-      }
-      renderChatList();
-    }
-
-    function autoResize(el) {
-      el.style.height = 'auto';
-      el.style.height = Math.min(el.scrollHeight, 120) + 'px';
-    }
-
-    function handleKeyDown(e) {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendMessage();
-      }
-    }
-
-    function handleFileSelect(event) {
-      const files = Array.from(event.target.files);
-      files.forEach(file => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          attachedFiles.push({
-            name: file.name,
-            type: file.type,
-            size: file.size,
-            data: e.target.result
-          });
-          renderAttachmentPreviews();
-        };
-        reader.readAsDataURL(file);
-      });
-      event.target.value = '';
-    }
-
-    function renderAttachmentPreviews() {
-      const container = document.getElementById('attachments-preview');
-      container.innerHTML = '';
-      attachedFiles.forEach((file, index) => {
-        const pill = document.createElement('div');
-        pill.className = 'preview-pill';
-        pill.innerHTML = `<span>📄 ${escapeHtml(file.name)}</span><span class="remove" onclick="removeAttachment(${index})">✕</span>`;
-        container.appendChild(pill);
-      });
-    }
-
-    function removeAttachment(index) {
-      attachedFiles.splice(index, 1);
-      renderAttachmentPreviews();
-    }
-
-    function appendMessageUI(role, content, model = null, files = []) {
-      const container = document.getElementById('chat-container');
-      const msgDiv = document.createElement('div');
-      msgDiv.className = `message ${role}`;
-
-      let inner = '';
-      if (role === 'assistant' && model) {
-        inner += `<div class="model-tag">${escapeHtml(model)}</div>`;
-      }
-      if (files && files.length > 0) {
-        inner += `<div class="files-badge-container">`;
-        files.forEach(f => {
-          inner += `<span class="file-badge">📎 ${escapeHtml(f.name || f)}</span>`;
-        });
-        inner += `</div>`;
-      }
-
-      inner += `<div>${role === 'assistant' ? marked.parse(content) : escapeHtml(content).replace(/\\n/g, '<br>')}</div>`;
-      msgDiv.innerHTML = inner;
-      container.appendChild(msgDiv);
-      container.scrollTop = container.scrollHeight;
-    }
-
-    async function sendMessage() {
-      const input = document.getElementById('prompt-input');
-      const text = input.value.trim();
-      const model = document.getElementById('model-select').value;
-      const sendBtn = document.getElementById('send-btn');
-
-      if (!text && attachedFiles.length === 0) return;
-
-      const currentFiles = [...attachedFiles];
-      attachedFiles = [];
-      renderAttachmentPreviews();
-
-      input.value = '';
-      input.style.height = '44px';
-
-      appendMessageUI('user', text, null, currentFiles);
-
-      const chat = chats.find(c => c.id === currentChatId);
-      if (chat) {
-        if (chat.messages.length === 0 && text) {
-          chat.title = text.slice(0, 24) + (text.length > 24 ? '...' : '');
-        }
-        chat.messages.push({ role: 'user', content: text, files: currentFiles });
-        saveChats();
-        renderChatList();
-      }
-
-      sendBtn.disabled = true;
-
-      try {
-        const response = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: model,
-            messages: chat ? chat.messages : [{ role: 'user', content: text }],
-            current_message: text,
-            files: currentFiles
-          })
-        });
-
-        const data = await response.json();
-        if (data.error) {
-          appendMessageUI('assistant', '⚠️ Ошибка: ' + data.error);
-        } else {
-          appendMessageUI('assistant', data.reply, model);
-          if (chat) {
-            chat.messages.push({ role: 'assistant', content: data.reply, model: model });
-            saveChats();
-          }
-        }
-      } catch (err) {
-        appendMessageUI('assistant', '⚠️ Не удалось связаться с сервером.');
-      } finally {
-        sendBtn.disabled = false;
-      }
-    }
-
-    function escapeHtml(text) {
-      if (!text) return '';
-      const div = document.createElement('div');
-      div.innerText = text;
-      return div.innerHTML;
-    }
-
-    init();
-  </script>
-</body>
-</html>
-"""
-
-
-# --- File and Data Processing Helpers ---
-def extract_file_content(file_item: Dict[str, Any]) -> Dict[str, Any]:
-    """Decodes data URL, extracts text from files or archives, prepares multimodal format."""
-    name = file_item.get("name", "file")
-    data_url = file_item.get("data", "")
-
-    if "," in data_url:
-        header, b64_data = data_url.split(",", 1)
+async def publish_post_data(data):
+    """Функция непосредственной публикации поста в канал"""
+    sent_msg = None
+    
+    if data['reg_type'] == 'reg_opinion':
+        if data['type1'] == 'photo':
+            sent_msg = await bot.send_photo(CHANNEL_ID, data['photo1'], caption=data['final_caption'], parse_mode="HTML")
+        else:
+            sent_msg = await bot.send_video(CHANNEL_ID, data['photo1'], caption=data['final_caption'], parse_mode="HTML")
     else:
-        header, b64_data = "", data_url
+        m1 = InputMediaPhoto(media=data['photo1'], caption=data['final_caption'], parse_mode="HTML") if data['type1'] == 'photo' else InputMediaVideo(media=data['photo1'], caption=data['final_caption'], parse_mode="HTML")
+        m2 = InputMediaPhoto(media=data['photo2']) if data['type2'] == 'photo' else InputMediaVideo(media=data['photo2'])
+        
+        media_group = await bot.send_media_group(CHANNEL_ID, media=[m1, m2])
+        sent_msg = media_group[0]
+    
+    logging.info("Пост успешно опубликован.")
 
-    try:
-        raw_bytes = base64.b64decode(b64_data)
-    except Exception:
-        return {"type": "text", "text": f"[Не удалось декодировать файл {name}]"}
+    if data['reg_type'] == 'reg_pb' and sent_msg:
+        message_id = sent_msg.message_id
+        
+        players_raw = data.get('players', '').split('\n')
+        names_raw = data.get('name', '').split('\n')
+        conditions = data.get('conditions', 'Нет условий')
+        
+        clean_players = [p.strip() for p in players_raw if p.strip()]
+        clean_names = [n.strip() for n in names_raw if n.strip()]
+        
+        walker_idx = random.randint(0, len(clean_players) - 1) if clean_players else 0
+        walker_user = clean_players[walker_idx] if clean_players else "@unknown"
+        
+        poll_options = []
+        for name in clean_names:
+            if name:
+                poll_options.append(name)
+        
+        if not poll_options:
+            poll_options = ["Player 1", "Player 2"]
 
-    # Handle Images
-    if any(name.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp", ".gif"]):
-        return {
-            "type": "image_url",
-            "image_url": {"url": data_url}
-        }
-
-    # Handle ZIP Archives
-    if name.lower().endswith(".zip"):
-        extracted_summary = [f"--- Содержимое архива {name} ---"]
         try:
-            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as z:
-                for file_info in z.infolist():
-                    if file_info.is_dir():
-                        continue
-                    extracted_summary.append(f"Файл: {file_info.filename} ({file_info.file_size} байт)")
-                    # If it is a text-like file, read up to 10KB
-                    if any(file_info.filename.lower().endswith(ext) for ext in [".txt", ".py", ".js", ".json", ".md", ".csv", ".html", ".css", ".xml", ".env"]):
-                        try:
-                            with z.open(file_info) as f:
-                                preview = f.read(10000).decode("utf-8", errors="ignore")
-                                extracted_summary.append(f"```\\n{preview}\\n```")
-                        except Exception:
-                            pass
-            return {"type": "text", "text": "\\n".join(extracted_summary)}
+            await bot.send_poll(
+                chat_id=CHANNEL_ID,
+                question="Кто победит?",
+                options=poll_options,
+                is_anonymous=True,
+                type=PollType.REGULAR,
+                reply_to_message_id=message_id 
+            )
         except Exception as e:
-            return {"type": "text", "text": f"[Ошибка чтения zip архива {name}: {str(e)}]"}
+            logging.error(f"Ошибка создания опроса: {e}")
 
-    # Handle Plain text/Code/Documents
-    try:
-        text_content = raw_bytes.decode("utf-8", errors="ignore")
-        return {"type": "text", "text": f"--- Файл: {name} ---\\n{text_content}"}
-    except Exception:
-        return {"type": "text", "text": f"[Файл {name} содержит бинарные данные, размер: {len(raw_bytes)} байт]"}
+        # Ожидаем автоматическую пересылку поста в чат комментариев
+        comment_msg_id = None
+        for _ in range(60): # Увеличено до 30 секунд, чтобы точно дождаться пересылки от Telegram
+            if message_id in recent_channel_posts:
+                comment_msg_id = recent_channel_posts.pop(message_id)
+                break
+            await asyncio.sleep(0.5)
 
+        channel_id_clean = str(CHANNEL_ID)[4:]
+        post_link = f"https://t.me/c/{channel_id_clean}/{message_id}"
 
-# --- Web Server Handlers ---
-async def handle_index(request: web.Request) -> web.Response:
-    return web.Response(text=HTML_TEMPLATE, content_type="text/html")
-
-
-async def handle_chat_api(request: web.Request) -> web.Response:
-    try:
-        body = await request.json()
-        model_id = body.get("model", "claude-opus-5")
-        raw_messages = body.get("messages", [])
-        current_message = body.get("current_message", "")
-        files = body.get("files", [])
-
-        # Build payload for OpenAI-compatible endpoint
-        api_messages = []
-        for msg in raw_messages[:-1]:
-            role = "user" if msg.get("role") == "user" else "assistant"
-            content = msg.get("content", "")
-            if content:
-                api_messages.append({"role": role, "content": content})
-
-        # Process current turn with potential multimodal/file attachments
-        user_content_parts = []
-        if current_message:
-            user_content_parts.append({"type": "text", "text": current_message})
-
-        for f in files:
-            extracted = extract_file_content(f)
-            user_content_parts.append(extracted)
-
-        if not user_content_parts:
-            user_content_parts.append({"type": "text", "text": "Привет"})
-
-        api_messages.append({"role": "user", "content": user_content_parts})
-
-        response = await client.chat.completions.create(
-            model=model_id,
-            messages=api_messages,
+        comment_text = (
+            f" <a href='{post_link}'>Пост ПБ</a>\n\n"
+            f"<b>Бот определил, ходит — {walker_user}. Удачи в пруфбаттле! 🔥</b>\n\n"
+            f"<b>Условие пруфбаттла: {conditions}</b>"
         )
+        
+        kb_comment = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="👉 Перейти к посту", url=post_link, style="primary")
+        ]])
 
-        reply = response.choices[0].message.content
-        return web.json_response({"reply": reply})
-
-    except Exception as e:
-        logger.error(f"API Error: {str(e)}")
-        return web.json_response({"error": str(e)}, status=500)
-
-
-# --- Aiogram Bot Setup ---
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🚀 Открыть Agent Task",
-                    web_app=WebAppInfo(url=WEBAPP_URL)
+        try:
+            if comment_msg_id:
+                await bot.send_message(
+                    chat_id=COMMENTS_CHAT_ID,
+                    text=comment_text,
+                    parse_mode="HTML",
+                    reply_markup=kb_comment,
+                    reply_to_message_id=comment_msg_id,
+                    disable_web_page_preview=False
                 )
-            ]
-        ]
+            else:
+                # Если пост так и не переслался, мы НЕ отправляем это в общий чат.
+                logging.error("Таймаут ожидания: пересылка в комментарии не найдена, сообщение отменено.")
+        except Exception as e:
+            logging.error(f"Ошибка отправки комментария: {e}")
+
+# ---------- ОСНОВНОЕ МЕНЮ ----------
+
+async def show_main_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    is_admin = (message.from_user.id == 5480751648)
+    await message.answer(
+        "Салам, статюганище! Выбери тип регистрации:",
+        reply_markup=get_main_kb(is_admin=is_admin)
     )
     await message.answer(
-        "👋 Привет! Добро пожаловать в **Agent Task**.\n\n"
-        "Нажмите кнопку ниже, чтобы запустить чат с моделями Claude.",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
+        "Для перезапуска бота нажмите кнопку ниже:",
+        reply_markup=get_restart_kb()
     )
 
+# ---------- РАБОТА ПУБЛИКАЦИИ ----------
 
-# --- Application Runner ---
-async def start_all():
-    app = web.Application()
-    app.router.add_get("/", handle_index)
-    app.router.add_post("/api/chat", handle_chat_api)
+async def publication_worker():
+    global last_publish_time
+    while True:
+        current_time = time.time()
+        if publish_queue and (current_time - last_publish_time >= PUBLISH_INTERVAL):
+            data = publish_queue.pop(0)
+            try:
+                await publish_post_data(data)
+                last_publish_time = time.time()
+            except Exception as e:
+                logging.error(f"Ошибка публикации: {e}")
+        await asyncio.sleep(10)
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"Mini App server running on port {PORT}")
+# ---------- ХЕНДЛЕРЫ КОМАНД ----------
 
-    if bot:
-        logger.info("Starting Telegram Bot Polling...")
-        await dp.start_polling(bot)
+@dp.message(Command("start"), F.chat.type == "private")
+async def cmd_start(message: types.Message, state: FSMContext):
+    await show_main_menu(message, state)
+
+@dp.message(Command("reyt"), F.chat.type == "private")
+async def show_rating(message: types.Message):
+    if not moderator_stats:
+        await message.answer("Пока нет статистики.")
+        return
+    
+    sorted_stats = sorted(moderator_stats.items(), key=lambda x: x[1], reverse=True)
+    text = "<b>Рейтинг модераторов:</b>\n\n"
+    for i, (user_id, count) in enumerate(sorted_stats, 1):
+        text += f"{i}. <a href='tg://user?id={user_id}'>Модератор</a> — {count}\n"
+    
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(F.text == "🤖 Перезапустить", F.chat.type == "private")
+async def restart_handler(message: types.Message, state: FSMContext):
+    await show_main_menu(message, state)
+
+@dp.callback_query(F.data.in_(["reg_opinion", "reg_pb"]))
+async def start_reg(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(reg_type=callback.data)
+    await state.set_state(RegForm.waiting_name)
+    text = "Отправь имя персонажа.." if callback.data == "reg_opinion" else "Отправь имена персонажей (с новой строки).."
+    await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_send_to_channel")
+async def admin_send_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != 5480751648:
+        await callback.answer("У вас нет прав.", show_alert=True)
+        return
+    await state.set_state(RegForm.waiting_admin_message)
+    await callback.message.answer("📢 Перешлите сюда любое сообщение, чтобы переслать его с автором, ИЛИ просто отправьте текст/медиа, чтобы опубликовать его обычно.")
+    await callback.answer()
+
+# ---------- ЛОГИКА АДМИН-ОТПРАВКИ ----------
+
+@dp.message(RegForm.waiting_admin_message)
+async def process_admin_message(message: types.Message, state: FSMContext):
+    # Проверяем, является ли сообщение пересланным
+    is_forward = (message.forward_origin is not None or 
+                  message.forward_from is not None or 
+                  message.forward_from_chat is not None)
+    
+    try:
+        if is_forward:
+            # Если это пересылка, сохраняем "эффект пересылки"
+            await message.forward(chat_id=CHANNEL_ID)
+            await message.answer("✅ Переслано в канал!")
+        else:
+            # Если это обычное сообщение, копируем контент (публикуется как обычный пост)
+            await message.copy_to(chat_id=CHANNEL_ID)
+            await message.answer("✅ Опубликовано в канал!")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+    
+    await show_main_menu(message, state)
+
+# ---------- ЭТАПЫ РЕГИСТРАЦИИ ----------
+
+@dp.message(RegForm.waiting_name)
+async def process_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await state.set_state(RegForm.waiting_universe)
+    await message.answer("Отправь вселенные (каждую с новой строки или через запятую)..")
+
+@dp.message(RegForm.waiting_universe)
+async def process_universe(message: types.Message, state: FSMContext):
+    await state.update_data(universe=message.text)
+    data = await state.get_data()
+    if data['reg_type'] == 'reg_pb':
+        await state.set_state(RegForm.waiting_players)
+        await message.answer("Отправь юзернеймы игроков (каждый с новой строки)..")
     else:
-        logger.warning("BOT_TOKEN not provided. Running Web Server only.")
-        while True:
-            await asyncio.sleep(3600)
+        await state.set_state(RegForm.waiting_conditions)
+        await message.answer("Отправь условия (или напиши 'нет')..")
 
+@dp.message(RegForm.waiting_players)
+async def process_players(message: types.Message, state: FSMContext):
+    await state.update_data(players=message.text)
+    await state.set_state(RegForm.waiting_conditions)
+    await message.answer("Отправь условия (или напиши 'нет')..")
+
+@dp.message(RegForm.waiting_conditions)
+async def process_cond(message: types.Message, state: FSMContext):
+    await state.update_data(conditions=message.text)
+    await state.set_state(RegForm.waiting_photo)
+    await message.answer("Отправь арт или видео (эдит)..")
+
+@dp.message(RegForm.waiting_photo, F.photo | F.video)
+async def process_photo1(message: types.Message, state: FSMContext):
+    file_id = message.photo[-1].file_id if message.photo else message.video.file_id
+    await state.update_data(photo1=file_id, type1='photo' if message.photo else 'video')
+    data = await state.get_data()
+    if data['reg_type'] == 'reg_pb':
+        await state.set_state(RegForm.waiting_photo2)
+        await message.answer("Отправь второй арт или видео..")
+    else:
+        await finalize_preview(message, state)
+
+@dp.message(RegForm.waiting_photo2, F.photo | F.video)
+async def process_photo2(message: types.Message, state: FSMContext):
+    file_id = message.photo[-1].file_id if message.photo else message.video.file_id
+    await state.update_data(photo2=file_id, type2='photo' if message.photo else 'video')
+    await finalize_preview(message, state)
+
+async def finalize_preview(message, state):
+    data = await state.get_data()
+    author_mention = f'<a href="tg://user?id={message.from_user.id}">{html.quote(message.from_user.first_name)}</a>'
+    
+    if data['reg_type'] == 'reg_opinion':
+        unis = "\n".join([f"➤ {html.quote(u.strip())}" for u in data['universe'].replace(',', '\n').split('\n') if u.strip()])
+        conds = "Не" if data['conditions'].lower() == "нет" else html.quote(data['conditions'])
+    
+        custom_footer = " Ꮶᴛᴏ нибудь жᴇᴧᴀᴇᴛ дᴀᴛь ᴇʍу ᴏᴛᴨᴏᴩ ʙ ɸᴏᴩᴍᴀᴛᴇ ᴨᴩуɸбᴀᴛᴛᴧ?"
+        
+        caption = (
+            f"<b>— автор мнения:</b> {author_mention}\n\n"
+            f"<u><b>{html.quote(data['name'])}</b></u> <b>аннигилирует всех персонажей из ниже представленных вселенных:</b>\n"
+            f"<blockquote><b>{unis}</b></blockquote>\n"
+            f"<blockquote><b>Условия баттла: {conds}</b></blockquote>\n"
+            f"{custom_footer}"
+        )
+    else:
+        chars = [html.quote(c.strip()) for c in data['name'].split('\n')]
+        universes = [html.quote(u.strip()) for u in data['universe'].split('\n')]
+        players = [html.quote(p.strip()) for p in data['players'].split('\n')]
+        
+        p1, p2 = (chars[0] if len(chars)>0 else "P1"), (chars[1] if len(chars)>1 else "P2")
+        u1, u2 = (universes[0] if len(universes)>0 else "U1"), (universes[1] if len(universes)>1 else "U2")
+        pl1, pl2 = (players[0] if len(players)>0 else "@id1"), (players[1] if len(players)>1 else "@id2")
+        
+        caption = (
+            f"<blockquote><b>ПЕРСОНАЛЬНЫЙ ПРУФ-БАТТЛ</b></blockquote>\n\n"
+            f"<b>Player 1:</b> {pl1}\n"
+            f"<b>{p1} — «{u1}»</b>\n\n"
+            f"<b>       * V-E-R-S-U-S *</b>\n\n"
+            f"<b>{p2} — «{u2}»</b>\n"
+            f"<b>Player 2:</b> {pl2}\n\n"
+            f" <b>「<a href='{RULES_LINK}'>Правила боёв</a>」</b>"
+        )
+
+    await state.update_data(final_caption=caption)
+    if data['reg_type'] == 'reg_opinion':
+        target = bot.send_photo if data['type1'] == 'photo' else bot.send_video
+        await target(message.chat.id, data['photo1'], caption=caption, parse_mode="HTML", reply_markup=get_confirm_kb())
+    else:
+        m1 = InputMediaPhoto(media=data['photo1'], caption=caption, parse_mode="HTML") if data['type1'] == 'photo' else InputMediaVideo(media=data['photo1'], caption=caption, parse_mode="HTML")
+        m2 = InputMediaPhoto(media=data['photo2']) if data['type2'] == 'photo' else InputMediaVideo(media=data['photo2'])
+        await bot.send_media_group(message.chat.id, media=[m1, m2])
+        await message.answer("Проверь ПБ выше. На модерацию?", reply_markup=get_confirm_kb())
+
+# ---------- ОТПРАВКА НА МОДЕРАЦИЮ ----------
+
+@dp.callback_query(F.data == "confirm_send")
+async def send_to_mod(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    post_id = f"post_{callback.from_user.id}_{int(time.time())}"
+    pending_posts[post_id] = data
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Опубликовать ", callback_data=f"publish_{post_id}", style="success"),
+            InlineKeyboardButton(text="Отменить ", callback_data=f"reject_{post_id}", style="danger")
+        ],
+        [
+            InlineKeyboardButton(text="Опубликовать без очереди", callback_data=f"publish_now_{post_id}", style="primary")
+        ]
+    ])
+    
+    if data['reg_type'] == 'reg_opinion':
+        target = bot.send_photo if data['type1'] == 'photo' else bot.send_video
+        await target(MOD_CHAT_ID, data['photo1'], caption=data['final_caption'], parse_mode="HTML", reply_markup=kb, message_thread_id=MOD_THREAD_ID)
+    else:
+        m1 = InputMediaPhoto(media=data['photo1'], caption=data['final_caption'], parse_mode="HTML") if data['type1'] == 'photo' else InputMediaVideo(media=data['photo1'], caption=data['final_caption'], parse_mode="HTML")
+        m2 = InputMediaPhoto(media=data['photo2']) if data['type2'] == 'photo' else InputMediaVideo(media=data['photo2'])
+        await bot.send_media_group(MOD_CHAT_ID, media=[m1, m2], message_thread_id=MOD_THREAD_ID)
+        await bot.send_message(MOD_CHAT_ID, f" ПБ от {callback.from_user.first_name}", reply_markup=kb, message_thread_id=MOD_THREAD_ID)
+        
+    await callback.message.answer("✅ Отправлено модераторам!")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("reject_"))
+async def reject_item(callback: types.CallbackQuery):
+    post_id = callback.data.replace("reject_", "")
+    if post_id in pending_posts:
+        del pending_posts[post_id]
+    await callback.message.delete()
+    await bot.send_message(MOD_CHAT_ID, "⛔ Публикация отменена.", message_thread_id=MOD_THREAD_ID)
+    await callback.answer("Отменено")
+
+# Помещаем publish_now_ перед publish_, чтобы он проверялся первым
+@dp.callback_query(F.data.startswith("publish_now_"))
+async def publish_now_item(callback: types.CallbackQuery):
+    post_id = callback.data.replace("publish_now_", "")
+    data = pending_posts.get(post_id)
+    if not data:
+        await callback.answer("Ошибка: пост уже в очереди или опубликован!", show_alert=True)
+        try: await callback.message.delete()
+        except: pass
+        return
+
+    moderator_stats[callback.from_user.id] = moderator_stats.get(callback.from_user.id, 0) + 1
+    
+    try:
+        await publish_post_data(data)
+        global last_publish_time
+        last_publish_time = time.time()
+        
+        try:
+            await callback.message.delete()
+            text = f"🚀 Пост от {callback.from_user.first_name} опубликован без очереди!"
+            await bot.send_message(MOD_CHAT_ID, text, message_thread_id=MOD_THREAD_ID)
+        except TelegramBadRequest:
+            pass
+
+        del pending_posts[post_id]
+        await callback.answer("⚡ Опубликовано без очереди!")
+    except Exception as e:
+        logging.error(f"Ошибка немедленной публикации: {e}")
+        await callback.answer("❌ Ошибка при публикации!", show_alert=True)
+
+@dp.callback_query(F.data.startswith("publish_"))
+async def publish_item(callback: types.CallbackQuery):
+    post_id = callback.data.replace("publish_", "")
+    data = pending_posts.get(post_id)
+    if not data:
+        await callback.answer("Ошибка: пост уже в очереди!", show_alert=True)
+        try: await callback.message.delete()
+        except: pass
+        return
+
+    publish_queue.append(data)
+    moderator_stats[callback.from_user.id] = moderator_stats.get(callback.from_user.id, 0) + 1
+    
+    try:
+        await callback.message.delete()
+        text = f"⏳ Пост от {callback.from_user.first_name} в очереди (5 мин)."
+        await bot.send_message(MOD_CHAT_ID, text, message_thread_id=MOD_THREAD_ID)
+    except TelegramBadRequest:
+        pass
+
+    del pending_posts[post_id]
+    await callback.answer("✅ Добавлено в очередь!")
+
+@dp.callback_query(F.data == "cancel")
+async def cancel_reg(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("❌ Отменено.")
+
+# ---------- ЗАПУСК ----------
+
+async def main():
+    print(">>> БОТ ЗАПУЩЕН <<<")
+    asyncio.create_task(publication_worker())
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(start_all())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("App stopped.")
+    asyncio.run(main())
