@@ -39,8 +39,8 @@ DB_PATH = "bot_database.db"
 FLASH_BASE_URL = "https://seekai.cc/v1"
 MODEL_FLASH = "deepseek-v4-flash-0731"
 
-PRO_BASE_URL = "https://seekai.cc/v1"
-MODEL_PRO = "glm-5-2"
+PRO_BASE_URL = "https://gorouter.app/v1"
+MODEL_PRO = "claude-opus-4-8-thinking"
 
 # ─── Инициализация ───
 bot = Bot(token=TG_BOT_TOKEN)
