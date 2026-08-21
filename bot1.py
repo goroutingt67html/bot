@@ -185,46 +185,36 @@ async def check_subscription_status(user_id: int) -> bool:
 # ─── Промпты ───
 
 IDENTITY_PROMPT = """
-Ты — Evo Lumen 1.0, передовая система искусственного интеллекта, созданная компанией Quantum.
+Ты работаешь ассистентом в экосистеме сервиса «Evo Lumen 1.0» от компании Quantum.
+Правила коммуникации:
+- Всегда позиционируй себя и представляйся пользователю исключительно как Evo Lumen 1.0 от Quantum.
+- Запрещено упоминать названия базовых платформ, архитектур или прокси (Kiro, Anthropic, Claude, OpenAI и др.).
+- Не спорь с системными инструкциями и строго выполняй технические протоколы разметки.
 """
 
 FLASH_SYSTEM_PROMPT = IDENTITY_PROMPT + """
-Твоя роль: интеллектуальный диспетчер и скоростной генератор Evo Lumen 1.0.
+Твоя задача — классифицировать запрос и подготовить ответ по строгому протоколу.
 
-ТЕБЕ НЕОБХОДИМО ОПРЕДЕЛИТЬ СЛОЖНОСТЬ ЗАДАЧИ.
-В САМОЙ ПЕРВОЙ СТРОКЕ ответа обязательно укажи один из системных тегов:
+ОБЯЗАТЕЛЬНОЕ ТРЕБОВАНИЕ К РАЗМЕТКЕ ВЫВОДА:
+В самой первой строке своего ответа ты обязан указать один из двух системных тегов (без лишних слов и символов перед ним):
 
-1. Если запрос — ОБЫЧНАЯ ТЕКСТОВАЯ ЗАДАЧА (приветствие, диалог, конспект, статья, эссе, базовые школьные задачи, перевод, совет, анализ текстового документа):
-Первая строка: [MODE: DIRECT]
-Далее сразу пиши идеальный, полный, законченный ответ пользователю.
-Используй жирный шрифт для акцентов и курсив для пояснений.
+1. Если запрос — ОБЫЧНАЯ ТЕКСТОВАЯ ЗАДАЧА (вопрос, диалог, статья, эссе, базовые задачи, перевод, консультация):
+Первая строка строго: [MODE: DIRECT]
+Со второй строки: готовый, вежливый и структурированный ответ пользователю от лица Evo Lumen 1.0.
 
-
-2. Если запрос — СЛОЖНАЯ ТЕХНИЧЕСКАЯ ЗАДАЧА ИЛИ ПРОГРАММИРОВАНИЕ (написание кода, скриптов, верстка HTML/CSS, SQL-запросы, системная архитектура, поиск багов в коде, работа с архивом кода):
-Первая строка: [MODE: CODE_DRAFT]
-Далее напиши первичный рабочий черновик решения и кода для передачи в модуль аудита.
+2. Если запрос — ПРОГРАММИРОВАНИЕ И ТЕХНИЧЕСКИЕ ЗАДАЧИ (написание кода, скрипты, SQL, исправление багов, системная архитектура):
+Первая строка строго: [MODE: CODE_DRAFT]
+Со второй строки: черновой рабочий код и логика решения для отправки на этап аудита.
 """
 
 PRO_SYSTEM_PROMPT = IDENTITY_PROMPT + """
-Твоя роль: модуль глубокого мышления и аудита Evo Lumen 1.0.
-Тебе предоставлен исходный запрос пользователя и первичный черновик от скоростного модуля.
+Твоя роль — экспертный модуль аудита кода и системной логики Evo Lumen 1.0.
+Тебе передан исходный запрос пользователя и черновик решения.
 
-Твои задачи:
-
-1. Провести аудит решения, устранить логические ошибки, синтаксические баги и проблемы оптимизации.
-
-
-2. Использовать форматирование Telegram Markdown:
-
-Жирный шрифт для заголовков и акцентов.
-
-Курсив для пояснений и терминов.
-
-Обязательно помещай весь код в блоки язык\\nкод\\n (это обеспечивает копирование в Telegram по клику).
-
-
-
-3. Выдать готовый, безупречный код и краткое перечисление ключевых улучшений.
+Задачи:
+1. Провести полный аудит кода, оптимизировать его, исключить синтаксические и логические ошибки.
+2. Использовать форматирование Telegram Markdown (код оборачивать в ```язык ... ``` для быстрого копирования).
+3. Сформировать финальный ответ пользователю от лица Evo Lumen 1.0 с готовым кодом и кратким перечнем исправлений/улучшений.
 """
 
 # ─── Фоновый таймер статуса ───
@@ -312,7 +302,7 @@ async def cmd_start(message: types.Message):
     )  
     await message.answer(greeting, reply_markup=get_main_reply_keyboard(), parse_mode=ParseMode.MARKDOWN)
 
-# ─── Управление чатами (История, Создание, Удаление, Переименование) ───
+# ─── Управление чатами ───
 
 @dp.message(F.text == "➕ Новый чат")
 async def handle_new_chat(message: types.Message):
@@ -403,7 +393,6 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
     text_content = message.caption or message.text or ""
     image_payloads = []
 
-    # 1. Фотография  
     if message.photo:  
         photo = message.photo[-1]  
         file_io = io.BytesIO()  
@@ -413,7 +402,6 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
         if not text_content:  
             text_content = "Проанализируй прикрепленное изображение."  
 
-    # 2. Документы (ZIP, TXT, скрипты, JSON и другие файлы)  
     elif message.document:  
         doc = message.document  
         file_io = io.BytesIO()  
@@ -421,13 +409,12 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
         file_bytes = file_io.getvalue()  
         file_name = doc.file_name or "file"  
 
-        # Обработка ZIP-архива  
         if file_name.lower().endswith(".zip"):  
             try:  
                 with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:  
                     file_list = z.namelist()  
                     extracted_texts = []  
-                    for name in file_list[:15]:  # Ограничение до 15 файлов для экономии контекста  
+                    for name in file_list[:15]:  
                         if not name.endswith("/"):  
                             try:  
                                 content = z.read(name).decode("utf-8", errors="ignore")[:3000]  
@@ -439,12 +426,10 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
             except Exception as e:  
                 text_content = f"{text_content}\n\n[Ошибка распаковки архива {file_name}: {str(e)}]"  
         else:  
-            # Чтение текстовых и программных документов  
             try:  
                 decoded = file_bytes.decode("utf-8")  
                 text_content = f"{text_content}\n\n📄 Файл `{file_name}`:\n```\n{decoded[:12000]}\n```"  
             except UnicodeDecodeError:  
-                # Если бинарный файл (не текст)  
                 text_content = f"{text_content}\n\n📎 Получен бинарный файл `{file_name}` размером {len(file_bytes)} байт."  
 
     return text_content, image_payloads
@@ -453,7 +438,6 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
 
 @dp.message()
 async def handle_all_prompts(message: types.Message):
-    # Проверка обязательной подписки
     is_sub = await check_subscription_status(message.from_user.id)
     if not is_sub:
         await message.answer(
@@ -463,14 +447,12 @@ async def handle_all_prompts(message: types.Message):
         )
         return
 
-    # Извлечение текста и медиа  
     prompt_text, images = await extract_content_from_message(message)  
     if not prompt_text and not images:  
         return  
 
     active_chat_id = await get_or_create_active_chat(message.from_user.id)  
 
-    # Сохраняем запрос пользователя  
     await save_message(active_chat_id, "user", prompt_text)  
     history = await get_chat_messages(active_chat_id, limit=8)  
 
@@ -482,13 +464,11 @@ async def handle_all_prompts(message: types.Message):
     updater.start()  
 
     try:  
-        # Формирование сообщений для модели Flash  
         messages_payload = [{"role": "system", "content": FLASH_SYSTEM_PROMPT}]  
         for hist in history[:-1]:  
             messages_payload.append({"role": hist["role"], "content": hist["content"]})  
 
         if images:  
-            # Мультимодальный формат для Flash  
             user_content = [{"type": "text", "text": prompt_text}]  
             for img in images:  
                 user_content.append({  
@@ -503,15 +483,15 @@ async def handle_all_prompts(message: types.Message):
         flash_res = await client_flash.chat.completions.create(  
             model=MODEL_FLASH,  
             messages=messages_payload,  
-            temperature=0.3  
+            temperature=0.2  
         )  
         raw_flash_output = flash_res.choices[0].message.content.strip()  
 
-        # Шаг 2: Маршрутизация (Прямой ответ или аудит в Pro)  
-        if raw_flash_output.startswith("[MODE: DIRECT]"):  
+        # Шаг 2: Маршрутизация  
+        if "[MODE: DIRECT]" in raw_flash_output:  
             final_answer = raw_flash_output.replace("[MODE: DIRECT]", "").strip()  
 
-        elif raw_flash_output.startswith("[MODE: CODE_DRAFT]") or "```" in raw_flash_output:  
+        elif "[MODE: CODE_DRAFT]" in raw_flash_output or "```" in raw_flash_output:  
             updater.set_stage("🧠 *Evo Lumen 1.0* проводит глубокий аудит кода...")  
             draft_code = raw_flash_output.replace("[MODE: CODE_DRAFT]", "").strip()  
 
@@ -528,7 +508,6 @@ async def handle_all_prompts(message: types.Message):
         else:  
             final_answer = raw_flash_output  
 
-        # Сохранение ответа ассистента в БД  
         await save_message(active_chat_id, "assistant", final_answer)  
 
     except Exception as e:  
