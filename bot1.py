@@ -36,8 +36,8 @@ CHANNEL_USERNAME = "@Quantum_Evo"
 CHANNEL_URL = "https://t.me/Quantum_Evo"
 DB_PATH = "bot_database.db"
 
-FLASH_BASE_URL = "https://tabitoken.com/v1"
-MODEL_FLASH = "claude-opus-4-8"
+FLASH_BASE_URL = "https://seekai.cc/v1"
+MODEL_FLASH = "deepseek/deepseek-v4-flash"
 
 PRO_BASE_URL = "https://gorouter.app/v1"
 MODEL_PRO = "claude-opus-4-8-thinking"
