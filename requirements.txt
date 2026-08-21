@@ -10,3 +10,4 @@ python-multipart>=0.0.9
 beautifulsoup4
 pypdf
 python-docx
+asyncpg
