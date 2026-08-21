@@ -4,6 +4,8 @@ import time
 import base64
 import zipfile
 import asyncio
+import json
+import aiohttp
 import aiosqlite
 from dotenv import load_dotenv
 
@@ -46,8 +48,15 @@ MODEL_PRO = "claude-opus-4-8-thinking"
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-client_flash = AsyncOpenAI(api_key=FLASH_API_KEY, base_url=FLASH_BASE_URL)
-client_pro = AsyncOpenAI(api_key=PRO_API_KEY, base_url=PRO_BASE_URL)
+client_flash = AsyncOpenAI(
+    api_key=FLASH_API_KEY,
+    base_url=FLASH_BASE_URL
+)
+
+client_pro = AsyncOpenAI(
+    api_key=PRO_API_KEY,
+    base_url=PRO_BASE_URL
+)
 
 
 # ─── База Данных (aiosqlite) ───
@@ -61,6 +70,7 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,12 +81,14 @@ async def init_db():
                 FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
             )
         """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS active_sessions (
                 user_id INTEGER PRIMARY KEY,
                 active_chat_id INTEGER
             )
         """)
+
         await db.commit()
 
 
@@ -87,6 +99,7 @@ async def get_or_create_active_chat(user_id: int) -> int:
             (user_id,)
         ) as cursor:
             row = await cursor.fetchone()
+
             if row and row[0]:
                 return row[0]
 
@@ -97,26 +110,32 @@ async def get_or_create_active_chat(user_id: int) -> int:
             chat_id = cursor.lastrowid
 
         await db.execute(
-            "INSERT OR REPLACE INTO active_sessions (user_id, active_chat_id) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO active_sessions "
+            "(user_id, active_chat_id) VALUES (?, ?)",
             (user_id, chat_id)
         )
+
         await db.commit()
+
         return chat_id
 
 
 async def set_active_chat(user_id: int, chat_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO active_sessions (user_id, active_chat_id) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO active_sessions "
+            "(user_id, active_chat_id) VALUES (?, ?)",
             (user_id, chat_id)
         )
+
         await db.commit()
 
 
 async def get_user_chats(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, title FROM chats WHERE user_id = ? ORDER BY id DESC",
+            "SELECT id, title FROM chats "
+            "WHERE user_id = ? ORDER BY id DESC",
             (user_id,)
         ) as cursor:
             return await cursor.fetchall()
@@ -129,6 +148,7 @@ async def get_chat_title(chat_id: int):
             (chat_id,)
         ) as cursor:
             row = await cursor.fetchone()
+
             return row[0] if row else "Без названия"
 
 
@@ -138,13 +158,15 @@ async def delete_chat_db(chat_id: int, user_id: int):
             "DELETE FROM messages WHERE chat_id = ?",
             (chat_id,)
         )
+
         await db.execute(
             "DELETE FROM chats WHERE id = ?",
             (chat_id,)
         )
 
         async with db.execute(
-            "SELECT active_chat_id FROM active_sessions WHERE user_id = ?",
+            "SELECT active_chat_id FROM active_sessions "
+            "WHERE user_id = ?",
             (user_id,)
         ) as cursor:
             row = await cursor.fetchone()
@@ -164,19 +186,29 @@ async def rename_chat_db(chat_id: int, new_title: str):
             "UPDATE chats SET title = ? WHERE id = ?",
             (new_title, chat_id)
         )
+
         await db.commit()
 
 
-async def save_message(chat_id: int, role: str, content: str):
+async def save_message(
+    chat_id: int,
+    role: str,
+    content: str
+):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO messages (chat_id, role, content) VALUES (?, ?, ?)",
+            "INSERT INTO messages "
+            "(chat_id, role, content) VALUES (?, ?, ?)",
             (chat_id, role, content)
         )
+
         await db.commit()
 
 
-async def get_chat_messages(chat_id: int, limit: int = 10):
+async def get_chat_messages(
+    chat_id: int,
+    limit: int = 10
+):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT role, content FROM messages "
@@ -314,56 +346,189 @@ PRO_SYSTEM_PROMPT = IDENTITY_PROMPT + """
 """
 
 
-# ─── Получение ответа Flash через streaming ───
+# ─── Извлечение текста из JSON ───
+def extract_text_from_json(data):
+    if not isinstance(data, dict):
+        return None
+
+    # Стандартный OpenAI ChatCompletion
+    choices = data.get("choices")
+
+    if isinstance(choices, list) and choices:
+        first_choice = choices[0]
+
+        if isinstance(first_choice, dict):
+            message = first_choice.get("message")
+
+            if isinstance(message, dict):
+                content = message.get("content")
+
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+
+            delta = first_choice.get("delta")
+
+            if isinstance(delta, dict):
+                content = delta.get("content")
+
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+
+    # Нестандартные форматы
+    for key in (
+        "response",
+        "text",
+        "content",
+        "output"
+    ):
+        value = data.get(key)
+
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return None
+
+
+# ─── Flash через прямой HTTP ───
 async def get_flash_response(messages_payload):
     """
-    Flash API возвращает chat.completion.chunk.
-    Поэтому собираем весь ответ из streaming chunks.
+    Flash endpoint работает нестабильно с OpenAI SDK:
+    он может возвращать SSE/streaming независимо от параметров.
 
-    Некоторые chunks могут иметь:
-        choices=[]
+    Поэтому Flash читается напрямую через HTTP.
 
-    Такие chunks просто пропускаются.
+    Поддерживаются:
+    - обычный JSON;
+    - SSE data: {...};
+    - data: [DONE];
+    - data: DONE;
+    - chat.completion;
+    - chat.completion.chunk.
     """
 
-    flash_stream = await client_flash.chat.completions.create(
-        model=MODEL_FLASH,
-        messages=messages_payload,
-        temperature=0.3,
-        stream=True
-    )
+    url = f"{FLASH_BASE_URL}/chat/completions"
+
+    payload = {
+        "model": MODEL_FLASH,
+        "messages": messages_payload,
+        "temperature": 0.3,
+        "stream": True
+    }
+
+    headers = {
+        "Authorization": f"Bearer {FLASH_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream"
+    }
 
     collected_parts = []
 
-    async for chunk in flash_stream:
-        try:
-            if not chunk.choices:
-                continue
+    timeout = aiohttp.ClientTimeout(
+        total=180,
+        connect=30,
+        sock_read=180
+    )
 
-            for choice in chunk.choices:
-                delta = choice.delta
+    async with aiohttp.ClientSession(
+        timeout=timeout
+    ) as session:
 
-                if delta is None:
-                    continue
+        async with session.post(
+            url,
+            headers=headers,
+            json=payload
+        ) as response:
 
-                content = getattr(delta, "content", None)
+            response_text_type = response.headers.get(
+                "Content-Type",
+                ""
+            )
 
-                if content:
-                    collected_parts.append(content)
+            if response.status != 200:
+                error_body = await response.text()
 
-        except Exception:
-            # Пропускаем нестандартные chunks,
-            # не прерывая сборку ответа
-            continue
+                raise RuntimeError(
+                    f"Flash API HTTP {response.status}: "
+                    f"{error_body[:1000]}"
+                )
+
+            # ─────────────────────────────────────────
+            # Вариант 1: SSE / streaming
+            # ─────────────────────────────────────────
+            if (
+                "text/event-stream" in response_text_type
+                or "stream" in response_text_type
+                or "ndjson" in response_text_type
+            ):
+                async for raw_line in response.content:
+                    line = raw_line.decode(
+                        "utf-8",
+                        errors="ignore"
+                    ).strip()
+
+                    if not line:
+                        continue
+
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+
+                    if not line:
+                        continue
+
+                    if line in (
+                        "[DONE]",
+                        "DONE"
+                    ):
+                        break
+
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        # Иногда сервер может прислать
+                        # несколько data-строк или служебный текст.
+                        continue
+
+                    text_part = extract_text_from_json(data)
+
+                    if text_part:
+                        collected_parts.append(text_part)
+
+            # ─────────────────────────────────────────
+            # Вариант 2: обычный JSON
+            # ─────────────────────────────────────────
+            else:
+                body = await response.text()
+
+                try:
+                    data = json.loads(body)
+                except json.JSONDecodeError:
+                    # Иногда сервер может вернуть обычный текст.
+                    if body.strip():
+                        return body.strip()
+
+                    raise RuntimeError(
+                        "Flash API вернул пустой ответ."
+                    )
+
+                text = extract_text_from_json(data)
+
+                if text:
+                    return text
+
+                # Иногда JSON может содержать строку
+                # непосредственно как значение.
+                if isinstance(data, str) and data.strip():
+                    return data.strip()
 
     result = "".join(collected_parts).strip()
 
-    if not result:
-        raise ValueError(
-            "Flash API завершил streaming без текстового ответа."
-        )
+    if result:
+        return result
 
-    return result
+    raise RuntimeError(
+        "Flash API не вернул текстовый контент. "
+        "Сервер завершил запрос без content/delta.content."
+    )
 
 
 # ─── Фоновый таймер статуса ───
@@ -377,7 +542,9 @@ class StatusUpdater:
 
     async def _update_loop(self):
         while self.is_running:
-            elapsed = int(time.time() - self.start_time)
+            elapsed = int(
+                time.time() - self.start_time
+            )
 
             text = (
                 f"{self.stage}\n"
@@ -414,7 +581,10 @@ class StatusUpdater:
                 pass
 
 
-async def send_response(message: types.Message, text: str):
+async def send_response(
+    message: types.Message,
+    text: str
+):
     chunks = (
         [
             text[i:i + 4000]
@@ -436,7 +606,9 @@ async def send_response(message: types.Message, text: str):
 
 # ─── Обработка подписки ───
 @dp.callback_query(F.data == "verify_subscription")
-async def verify_sub_callback(call: CallbackQuery):
+async def verify_sub_callback(
+    call: CallbackQuery
+):
     is_sub = await check_subscription_status(
         call.from_user.id
     )
@@ -445,7 +617,8 @@ async def verify_sub_callback(call: CallbackQuery):
         await call.message.delete()
 
         await call.message.answer(
-            "🎉 **Спасибо за подписку!** Доступ к **Evo Lumen 1.0** разблокирован.",
+            "🎉 **Спасибо за подписку!** "
+            "Доступ к **Evo Lumen 1.0** разблокирован.",
             reply_markup=get_main_reply_keyboard(),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -459,15 +632,19 @@ async def verify_sub_callback(call: CallbackQuery):
 
 # ─── Обработчик команды /start ───
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
+async def cmd_start(
+    message: types.Message
+):
     is_sub = await check_subscription_status(
         message.from_user.id
     )
 
     if not is_sub:
         await message.answer(
-            "🔒 **Для использования бота необходимо подписаться на наш официальный канал!**\n\n"
-            "Подпишитесь и нажмите кнопку **«Подтвердить подписку»** ниже.",
+            "🔒 **Для использования бота необходимо "
+            "подписаться на наш официальный канал!**\n\n"
+            "Подпишитесь и нажмите кнопку "
+            "**«Подтвердить подписку»** ниже.",
             reply_markup=get_sub_keyboard(),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -478,7 +655,8 @@ async def cmd_start(message: types.Message):
     )
 
     greeting = (
-        "👋 Здравствуйте! Я **Evo Lumen 1.0** — искусственный интеллект, "
+        "👋 Здравствуйте! Я **Evo Lumen 1.0** — "
+        "искусственный интеллект, "
         "разработанный компанией **Quantum**.\n\n"
         "✨ **Возможности:**\n"
         "• Мгновенные ответы и решение задач\n"
@@ -495,19 +673,28 @@ async def cmd_start(message: types.Message):
     )
 
 
-# ─── Управление чатами (История, Создание, Удаление, Переименование) ───
+# ─── Управление чатами ───
 @dp.message(F.text == "➕ Новый чат")
-async def handle_new_chat(message: types.Message):
+async def handle_new_chat(
+    message: types.Message
+):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "INSERT INTO chats (user_id, title) VALUES (?, ?)",
-            (message.from_user.id, "Новый диалог")
+            (
+                message.from_user.id,
+                "Новый диалог"
+            )
         ) as cursor:
             new_id = cursor.lastrowid
 
         await db.execute(
-            "INSERT OR REPLACE INTO active_sessions (user_id, active_chat_id) VALUES (?, ?)",
-            (message.from_user.id, new_id)
+            "INSERT OR REPLACE INTO active_sessions "
+            "(user_id, active_chat_id) VALUES (?, ?)",
+            (
+                message.from_user.id,
+                new_id
+            )
         )
 
         await db.commit()
@@ -519,7 +706,9 @@ async def handle_new_chat(message: types.Message):
 
 
 @dp.message(F.text == "🖨️ История чатов")
-async def handle_history_menu(message: types.Message):
+async def handle_history_menu(
+    message: types.Message
+):
     chats = await get_user_chats(
         message.from_user.id
     )
@@ -552,7 +741,9 @@ async def handle_history_menu(message: types.Message):
 
 
 @dp.callback_query(F.data.startswith("chat_manage:"))
-async def handle_chat_manage(call: CallbackQuery):
+async def handle_chat_manage(
+    call: CallbackQuery
+):
     chat_id = int(
         call.data.split(":")[1]
     )
@@ -568,7 +759,9 @@ async def handle_chat_manage(call: CallbackQuery):
 
 
 @dp.callback_query(F.data == "chat_list_back")
-async def handle_chat_list_back(call: CallbackQuery):
+async def handle_chat_list_back(
+    call: CallbackQuery
+):
     chats = await get_user_chats(
         call.from_user.id
     )
@@ -594,7 +787,9 @@ async def handle_chat_list_back(call: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("chat_use:"))
-async def handle_chat_select(call: CallbackQuery):
+async def handle_chat_select(
+    call: CallbackQuery
+):
     chat_id = int(
         call.data.split(":")[1]
     )
@@ -614,7 +809,9 @@ async def handle_chat_select(call: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("chat_delete:"))
-async def handle_chat_delete(call: CallbackQuery):
+async def handle_chat_delete(
+    call: CallbackQuery
+):
     chat_id = int(
         call.data.split(":")[1]
     )
@@ -654,13 +851,21 @@ async def handle_chat_rename_prompt(
     )
 
 
-@dp.message(StateFilter(ChatStates.waiting_for_chat_rename))
+@dp.message(
+    StateFilter(
+        ChatStates.waiting_for_chat_rename
+    )
+)
 async def handle_chat_rename_input(
     message: types.Message,
     state: FSMContext
 ):
     data = await state.get_data()
-    chat_id = data.get("rename_chat_id")
+
+    chat_id = data.get(
+        "rename_chat_id"
+    )
+
     new_title = message.text.strip()[:60]
 
     if chat_id:
@@ -670,7 +875,8 @@ async def handle_chat_rename_input(
         )
 
         await message.answer(
-            f"✅ Название чата успешно изменено на: **{new_title}**",
+            f"✅ Название чата успешно изменено на: "
+            f"**{new_title}**",
             parse_mode=ParseMode.MARKDOWN
         )
 
@@ -682,7 +888,12 @@ async def extract_content_from_message(
     message: types.Message
 ) -> tuple[str, list]:
 
-    text_content = message.caption or message.text or ""
+    text_content = (
+        message.caption
+        or message.text
+        or ""
+    )
+
     image_payloads = []
 
     # 1. Фотография
@@ -700,14 +911,16 @@ async def extract_content_from_message(
             file_io.getvalue()
         ).decode("utf-8")
 
-        image_payloads.append(b64_img)
+        image_payloads.append(
+            b64_img
+        )
 
         if not text_content:
             text_content = (
                 "Проанализируй прикрепленное изображение."
             )
 
-    # 2. Документы (ZIP, TXT, скрипты, JSON и другие файлы)
+    # 2. Документы
     elif message.document:
         doc = message.document
 
@@ -734,27 +947,34 @@ async def extract_content_from_message(
                     for name in file_list[:15]:
                         if not name.endswith("/"):
                             try:
-                                content = z.read(name).decode(
+                                content = z.read(
+                                    name
+                                ).decode(
                                     "utf-8",
                                     errors="ignore"
                                 )[:3000]
 
                                 extracted_texts.append(
-                                    f"--- Файл: {name} ---\n{content}"
+                                    f"--- Файл: {name} ---\n"
+                                    f"{content}"
                                 )
 
                             except Exception:
                                 pass
 
                     archive_info = (
-                        f"📦 Содержимое ZIP архива ({file_name}):\n"
+                        f"📦 Содержимое ZIP архива "
+                        f"({file_name}):\n"
                         f"Список файлов: "
                         f"{', '.join(file_list[:30])}\n\n"
-                        + "\n\n".join(extracted_texts)
+                        + "\n\n".join(
+                            extracted_texts
+                        )
                     )
 
                     text_content = (
-                        f"{text_content}\n\n{archive_info}"
+                        f"{text_content}\n\n"
+                        f"{archive_info}"
                         if text_content
                         else archive_info
                     )
@@ -767,22 +987,25 @@ async def extract_content_from_message(
                 )
 
         else:
-            # Чтение текстовых и программных документов
             try:
-                decoded = file_bytes.decode("utf-8")
+                decoded = file_bytes.decode(
+                    "utf-8"
+                )
 
                 text_content = (
                     f"{text_content}\n\n"
                     f"📄 Файл `{file_name}`:\n"
-                    f"```\n{decoded[:12000]}\n```"
+                    f"```\n"
+                    f"{decoded[:12000]}"
+                    f"\n```"
                 )
 
             except UnicodeDecodeError:
-                # Если бинарный файл (не текст)
                 text_content = (
                     f"{text_content}\n\n"
-                    f"📎 Получен бинарный файл `{file_name}` "
-                    f"размером {len(file_bytes)} байт."
+                    f"📎 Получен бинарный файл "
+                    f"`{file_name}` размером "
+                    f"{len(file_bytes)} байт."
                 )
 
     return text_content, image_payloads
@@ -790,8 +1013,9 @@ async def extract_content_from_message(
 
 # ─── Основной обработчик сообщений с ИИ-конвейером ───
 @dp.message()
-async def handle_all_prompts(message: types.Message):
-
+async def handle_all_prompts(
+    message: types.Message
+):
     # Проверка обязательной подписки
     is_sub = await check_subscription_status(
         message.from_user.id
@@ -799,7 +1023,8 @@ async def handle_all_prompts(message: types.Message):
 
     if not is_sub:
         await message.answer(
-            "🔒 **Доступ ограничен!** Для продолжения диалога "
+            "🔒 **Доступ ограничен!** "
+            "Для продолжения диалога "
             "подпишитесь на наш канал.",
             reply_markup=get_sub_keyboard(),
             parse_mode=ParseMode.MARKDOWN
@@ -807,15 +1032,19 @@ async def handle_all_prompts(message: types.Message):
         return
 
     # Извлечение текста и медиа
-    prompt_text, images = await extract_content_from_message(
-        message
+    prompt_text, images = (
+        await extract_content_from_message(
+            message
+        )
     )
 
     if not prompt_text and not images:
         return
 
-    active_chat_id = await get_or_create_active_chat(
-        message.from_user.id
+    active_chat_id = (
+        await get_or_create_active_chat(
+            message.from_user.id
+        )
     )
 
     # Сохраняем запрос пользователя
@@ -836,7 +1065,10 @@ async def handle_all_prompts(message: types.Message):
         parse_mode=ParseMode.MARKDOWN
     )
 
-    updater = StatusUpdater(status_msg)
+    updater = StatusUpdater(
+        status_msg
+    )
+
     updater.start()
 
     try:
@@ -870,7 +1102,10 @@ async def handle_all_prompts(message: types.Message):
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/jpeg;base64,{img}"
+                            "url": (
+                                "data:image/jpeg;base64,"
+                                f"{img}"
+                            )
                         }
                     }
                 )
@@ -890,59 +1125,76 @@ async def handle_all_prompts(message: types.Message):
                 }
             )
 
-        # ─── Шаг 1: Flash модуль ───
-        # Flash API возвращает streaming chunks,
-        # поэтому собираем весь ответ через get_flash_response().
-        raw_flash_output = await get_flash_response(
-            messages_payload
+        # ─── Шаг 1: Flash ───
+        raw_flash_output = (
+            await get_flash_response(
+                messages_payload
+            )
         )
 
         # ─── Шаг 2: Маршрутизация ───
-        # Прямой ответ или аудит в Pro
-        if raw_flash_output.startswith("[MODE: DIRECT]"):
-
-            final_answer = raw_flash_output.replace(
-                "[MODE: DIRECT]",
-                ""
-            ).strip()
+        if raw_flash_output.startswith(
+            "[MODE: DIRECT]"
+        ):
+            final_answer = (
+                raw_flash_output
+                .replace(
+                    "[MODE: DIRECT]",
+                    "",
+                    1
+                )
+                .strip()
+            )
 
         elif (
-            raw_flash_output.startswith("[MODE: CODE_DRAFT]")
+            raw_flash_output.startswith(
+                "[MODE: CODE_DRAFT]"
+            )
             or "```" in raw_flash_output
         ):
-
             updater.set_stage(
-                "🧠 *Evo Lumen 1.0* проводит глубокий аудит кода..."
+                "🧠 *Evo Lumen 1.0* "
+                "проводит глубокий аудит кода..."
             )
 
-            draft_code = raw_flash_output.replace(
-                "[MODE: CODE_DRAFT]",
-                ""
-            ).strip()
+            draft_code = (
+                raw_flash_output
+                .replace(
+                    "[MODE: CODE_DRAFT]",
+                    "",
+                    1
+                )
+                .strip()
+            )
 
             pro_input = (
-                f"Исходный запрос:\n{prompt_text}\n\n"
-                f"Черновик решения:\n{draft_code}"
+                f"Исходный запрос:\n"
+                f"{prompt_text}\n\n"
+                f"Черновик решения:\n"
+                f"{draft_code}"
             )
 
-            pro_res = await client_pro.chat.completions.create(
-                model=MODEL_PRO,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": PRO_SYSTEM_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": pro_input
-                    }
-                ],
-                temperature=0.1
+            pro_res = (
+                await client_pro.chat.completions.create(
+                    model=MODEL_PRO,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": PRO_SYSTEM_PROMPT
+                        },
+                        {
+                            "role": "user",
+                            "content": pro_input
+                        }
+                    ],
+                    temperature=0.1
+                )
             )
 
-            # Pro оставляем без изменений
+            # Pro оставлен без изменений
             final_answer = (
-                pro_res.choices[0].message.content.strip()
+                pro_res.choices[0]
+                .message.content.strip()
             )
 
         else:
