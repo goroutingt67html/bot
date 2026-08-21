@@ -5,6 +5,8 @@ import time
 import base64
 import zipfile
 import asyncio
+import secrets
+from datetime import datetime, timedelta
 import aiohttp
 import asyncpg
 from bs4 import BeautifulSoup
@@ -14,9 +16,9 @@ import docx
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode, ChatMemberStatus
-from aiogram.filters import CommandStart, StateFilter
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
+from aiogram.filters import CommandStart, Command, StateFilter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -39,10 +41,10 @@ FLASH_API_KEY = os.getenv("FLASH_API_KEY", "")
 PRO_API_KEY = os.getenv("PRO_API_KEY", "")
 
 RAW_DB_URL = os.getenv("DATABASE_URL", "")
-# Railway иногда выдает префикс postgres:// вместо postgresql://
 DATABASE_URL = RAW_DB_URL.replace("postgres://", "postgresql://") if RAW_DB_URL else ""
 
-# ─── Настройки каналов и моделей ───
+ADMIN_ID = 5480751648
+RATE_LIMIT_SECONDS = 15
 
 CHANNEL_USERNAME = "@Quantum_Evo"
 CHANNEL_URL = "https://t.me/Quantum_Evo"
@@ -62,8 +64,9 @@ client_flash = AsyncOpenAI(api_key=FLASH_API_KEY, base_url=FLASH_BASE_URL)
 client_pro = AsyncOpenAI(api_key=PRO_API_KEY, base_url=PRO_BASE_URL)
 
 db_pool: asyncpg.Pool = None
+user_last_request_time: dict[int, float] = {}
 
-# ─── Словари форматов и расширений ───
+# ─── Словари расширений файлов ───
 
 EXT_MAP = {
     'python': 'py', 'py': 'py', 'питон': 'py', 'пайтон': 'py',
@@ -103,42 +106,39 @@ CODE_EXTENSIONS = {
 }
 
 DEFAULT_FILENAMES = {
-    'py': 'main.py',
-    'js': 'index.js',
-    'ts': 'index.ts',
-    'html': 'index.html',
-    'css': 'style.css',
-    'json': 'data.json',
-    'csv': 'data.csv',
-    'sql': 'query.sql',
-    'sh': 'script.sh',
-    'md': 'README.md',
-    'txt': 'document.txt',
-    'cpp': 'main.cpp',
-    'c': 'main.c',
-    'cs': 'Program.cs',
-    'java': 'Main.java',
-    'go': 'main.go',
-    'rs': 'main.rs',
-    'php': 'index.php',
-    'yaml': 'config.yaml',
-    'yml': 'config.yml'
+    'py': 'main.py', 'js': 'index.js', 'ts': 'index.ts', 'html': 'index.html',
+    'css': 'style.css', 'json': 'data.json', 'csv': 'data.csv', 'sql': 'query.sql',
+    'sh': 'script.sh', 'md': 'README.md', 'txt': 'document.txt', 'cpp': 'main.cpp',
+    'c': 'main.c', 'cs': 'Program.cs', 'java': 'Main.java', 'go': 'main.go',
+    'rs': 'main.rs', 'php': 'index.php', 'yaml': 'config.yaml', 'yml': 'config.yml'
 }
 
-# ─── База Данных (PostgreSQL via asyncpg) ───
+# ─── Инициализация и операции Базы Данных ───
 
 async def init_db():
     global db_pool
     if not DATABASE_URL:
-        raise ValueError("DATABASE_URL не задана в переменных окружения Railway!")
+        raise ValueError("DATABASE_URL не задана в переменных окружения!")
     
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=15)
     
     async with db_pool.acquire() as conn:
         await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            balance NUMERIC DEFAULT 0,
+            is_banned BOOLEAN DEFAULT FALSE,
+            is_blocked BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        await conn.execute("""
         CREATE TABLE IF NOT EXISTS chats (
             id SERIAL PRIMARY KEY,
-            user_id BIGINT,
+            user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
             title TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -154,10 +154,58 @@ async def init_db():
         """)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS active_sessions (
-            user_id BIGINT PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
             active_chat_id INTEGER
         );
         """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS activity_logs (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            content_type TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS promocodes (
+            code TEXT PRIMARY KEY,
+            reward NUMERIC DEFAULT 0,
+            max_activations INT DEFAULT 1,
+            used_count INT DEFAULT 0,
+            expires_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS promocode_activations (
+            id SERIAL PRIMARY KEY,
+            code TEXT REFERENCES promocodes(code) ON DELETE CASCADE,
+            user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+            activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(code, user_id)
+        );
+        """)
+
+async def track_user(user: types.User):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO users (user_id, username, first_name, last_activity)
+            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+            ON CONFLICT (user_id) DO UPDATE 
+            SET username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                is_blocked = FALSE,
+                last_activity = CURRENT_TIMESTAMP;
+        """, user.id, user.username or "", user.first_name or "")
+
+async def is_user_banned(user_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        val = await conn.fetchval("SELECT is_banned FROM users WHERE user_id = $1", user_id)
+        return bool(val)
+
+async def log_activity(user_id: int, content_type: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("INSERT INTO activity_logs (user_id, content_type) VALUES ($1, $2)", user_id, content_type)
 
 async def get_or_create_active_chat(user_id: int) -> int:
     async with db_pool.acquire() as conn:
@@ -196,7 +244,6 @@ async def get_chat_title(chat_id: int):
 
 async def delete_chat_db(chat_id: int, user_id: int):
     async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
         await conn.execute("DELETE FROM chats WHERE id = $1", chat_id)
         row = await conn.fetchrow("SELECT active_chat_id FROM active_sessions WHERE user_id = $1", user_id)
         if row and row["active_chat_id"] == chat_id:
@@ -213,15 +260,35 @@ async def save_message(chat_id: int, role: str, content: str):
 async def get_chat_messages(chat_id: int, limit: int = 10):
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT role, content FROM messages WHERE chat_id = $1 ORDER BY id DESC LIMIT $2",
+            "SELECT role, content, created_at FROM messages WHERE chat_id = $1 ORDER BY id DESC LIMIT $2",
             chat_id, limit
         )
-        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+        return [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in reversed(rows)]
+
+async def get_all_chat_messages(chat_id: int):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT role, content, created_at FROM messages WHERE chat_id = $1 ORDER BY id ASC",
+            chat_id
+        )
+        return [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
 
 # ─── FSM Состояния ───
 
 class ChatStates(StatesGroup):
     waiting_for_chat_rename = State()
+
+class UserStates(StatesGroup):
+    waiting_for_promo_code = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_user_query = State()
+    waiting_for_promo_reward = State()
+    waiting_for_promo_activations = State()
+    waiting_for_promo_duration = State()
+    waiting_for_broadcast_target = State()
+    waiting_for_broadcast_content = State()
+    waiting_for_broadcast_buttons = State()
 
 # ─── Клавиатуры ───
 
@@ -233,21 +300,36 @@ def get_sub_keyboard():
         ]
     )
 
-def get_main_reply_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="➕ Новый чат"), KeyboardButton(text="🖨️ История чатов")]
-        ],
-        resize_keyboard=True
-    )
+def get_main_reply_keyboard(is_admin: bool = False):
+    keyboard = [
+        [KeyboardButton(text="➕ Новый чат"), KeyboardButton(text="🖨️ История чатов")],
+        [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="🎁 Промокод")]
+    ]
+    if is_admin:
+        keyboard.append([KeyboardButton(text="⚡ Админ панель")])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 def get_chat_actions_keyboard(chat_id: int):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="▶️ Продолжить диалог", callback_data=f"chat_use:{chat_id}")],
-            [InlineKeyboardButton(text="✏️ Изменить название", callback_data=f"chat_rename:{chat_id}")],
-            [InlineKeyboardButton(text="🗑️ Удалить чат", callback_data=f"chat_delete:{chat_id}")],
+            [InlineKeyboardButton(text="📥 Экспорт .md", callback_data=f"chat_exp_md:{chat_id}"),
+             InlineKeyboardButton(text="📥 Экспорт .txt", callback_data=f"chat_exp_txt:{chat_id}")],
+            [InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"chat_rename:{chat_id}"),
+             InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"chat_delete:{chat_id}")],
             [InlineKeyboardButton(text="◀️ Назад к списку", callback_data="chat_list_back")]
+        ]
+    )
+
+def get_admin_main_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Метрики аудитории", callback_data="admin_metrics_audience"),
+             InlineKeyboardButton(text="📈 Метрики активности", callback_data="admin_metrics_activity")],
+            [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast_start"),
+             InlineKeyboardButton(text="🔍 Поиск пользователя", callback_data="admin_user_search")],
+            [InlineKeyboardButton(text="🎁 Создать промокод", callback_data="admin_create_promo")],
+            [InlineKeyboardButton(text="❌ Закрыть панель", callback_data="admin_close")]
         ]
     )
 
@@ -258,7 +340,7 @@ async def check_subscription_status(user_id: int) -> bool:
         member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
         return member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED)
     except Exception:
-        return False
+        return True
 
 # ─── Фоновый таймер статуса ───
 
@@ -295,11 +377,10 @@ class StatusUpdater:
             except asyncio.CancelledError:  
                 pass
 
-# ─── Логика распознавания и выгрузки файлов ───
+# ─── Логика файлов и экспорта ───
 
 def detect_file_request(user_prompt: str, ai_text: str) -> tuple[bool, str, str]:
     prompt_lower = user_prompt.lower()
-    
     filename_match = re.search(r'\b([a-zA-Z0-9_\-]+\.([a-zA-Z0-9]+))\b', user_prompt)
     
     file_intent_patterns = [
@@ -347,16 +428,13 @@ def detect_file_request(user_prompt: str, ai_text: str) -> tuple[bool, str, str]
 
 def extract_file_content(ai_text: str, ext: str, user_prompt: str) -> str:
     code_blocks = re.findall(r'```(?:[a-zA-Z0-9_+#\-\.]+)?\n([\s\S]*?)```', ai_text)
-    
-    # Для языков программирования отдаем ЧИСТЫЙ код без текста и маркдауна
     if ext in CODE_EXTENSIONS:
         if code_blocks:
             return "\n\n".join(b.strip() for b in code_blocks)
-        else:
-            cleaned = ai_text.strip()
-            cleaned = re.sub(r'^```[a-zA-Z0-9_\-\.]*\n?', '', cleaned)
-            cleaned = re.sub(r'\n?```$', '', cleaned).strip()
-            return cleaned
+        cleaned = ai_text.strip()
+        cleaned = re.sub(r'^```[a-zA-Z0-9_\-\.]*\n?', '', cleaned)
+        cleaned = re.sub(r'\n?```$', '', cleaned).strip()
+        return cleaned
 
     if ext == 'md':
         return ai_text.strip()
@@ -367,13 +445,10 @@ def extract_file_content(ai_text: str, ext: str, user_prompt: str) -> str:
             return "\n\n".join(b.strip() for b in code_blocks)
         return ai_text.strip()
 
-    if code_blocks:
-        return "\n\n".join(b.strip() for b in code_blocks)
-    return ai_text.strip()
+    return "\n\n".join(b.strip() for b in code_blocks) if code_blocks else ai_text.strip()
 
 async def send_response(message: types.Message, text: str, user_prompt: str = ""):
     wants_file, filename, ext = detect_file_request(user_prompt, text)
-
     if wants_file:
         file_content = extract_file_content(text, ext, user_prompt)
         if file_content:
@@ -393,54 +468,49 @@ async def send_response(message: types.Message, text: str, user_prompt: str = ""
         except TelegramBadRequest:
             await message.answer(chunk)
 
-# ─── Обработка подписки ───
-
-@dp.callback_query(F.data == "verify_subscription")
-async def verify_sub_callback(call: CallbackQuery):
-    is_sub = await check_subscription_status(call.from_user.id)
-    if is_sub:
-        await call.message.delete()
-        await call.message.answer(
-            "🎉 Спасибо за подписку! Доступ к Evo Lumen 1.0 разблокирован.",
-            reply_markup=get_main_reply_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
+async def build_chat_export_file(chat_id: int, format_type: str) -> BufferedInputFile:
+    title = await get_chat_title(chat_id)
+    messages = await get_all_chat_messages(chat_id)
+    
+    if format_type == "md":
+        content = f"# Экспорт диалога: {title}\n*ID диалога: {chat_id} | Экспортировано: {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n\n---\n\n"
+        for m in messages:
+            sender = "👤 Пользователь" if m["role"] == "user" else "🤖 Evo Lumen"
+            date_str = m["created_at"].strftime("%Y-%m-%d %H:%M:%S") if m["created_at"] else ""
+            content += f"### {sender} ({date_str})\n\n{m['content']}\n\n---\n\n"
+        filename = f"dialog_{chat_id}.md"
     else:
-        await call.answer("❌ Вы еще не подписались на канал!", show_alert=True)
+        content = f"=== ЭКСПОРТ ДИАЛОГА: {title} (ID: {chat_id}) ===\nДата: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+        for m in messages:
+            sender = "USER" if m["role"] == "user" else "EVO LUMEN"
+            date_str = m["created_at"].strftime("%Y-%m-%d %H:%M:%S") if m["created_at"] else ""
+            content += f"[{date_str}] {sender}:\n{m['content']}\n\n" + ("=" * 40) + "\n\n"
+        filename = f"dialog_{chat_id}.txt"
+        
+    return BufferedInputFile(content.encode("utf-8"), filename=filename)
 
-# ─── Обработчик команды /start ───
+# ─── Экспорт и Меню Чатов (Callbacks) ───
 
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    is_sub = await check_subscription_status(message.from_user.id)
-    if not is_sub:
-        await message.answer(
-            "🔒 Для использования бота необходимо подписаться на наш официальный канал!\n\n"
-            "Подпишитесь и нажмите кнопку «Подтвердить подписку» ниже.",
-            reply_markup=get_sub_keyboard(),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
+@dp.callback_query(F.data.startswith("chat_exp_md:"))
+async def handle_export_md(call: CallbackQuery):
+    chat_id = int(call.data.split(":")[1])
+    file = await build_chat_export_file(chat_id, "md")
+    await call.message.answer_document(file, caption=f"📥 Экспорт чата #{chat_id} в формате Markdown (.md)")
+    await call.answer()
 
-    await get_or_create_active_chat(message.from_user.id)  
-    greeting = (  
-        "👋 Здравствуйте! Я **Evo Lumen 1.0** — искусственный интеллект, "  
-        "разработанный компанией **Quantum**.\n\n"  
-        "✨ **Возможности:**\n"  
-        "• Мгновенные ответы и решение задач\n"  
-        "• Проектирование и аудит сложного программного кода\n"  
-        "• Анализ голосовых сообщений и аудио\n"  
-        "• Чтение книг и файлов (PDF, DOCX, EPUB, FB2, TXT, ZIP)\n"  
-        "• Анализ содержимого веб-страниц по URL-ссылкам\n"  
-        "• Выгрузка любого кода и текста в файлы нужного формата (`.py`, `.js`, `.html`, `.json`, `.md`, `.txt` и др.)\n"  
-        "• Сохранение истории в постоянной базе данных"  
-    )  
-    await message.answer(greeting, reply_markup=get_main_reply_keyboard(), parse_mode=ParseMode.MARKDOWN)
-
-# ─── Управление чатами ───
+@dp.callback_query(F.data.startswith("chat_exp_txt:"))
+async def handle_export_txt(call: CallbackQuery):
+    chat_id = int(call.data.split(":")[1])
+    file = await build_chat_export_file(chat_id, "txt")
+    await call.message.answer_document(file, caption=f"📥 Экспорт чата #{chat_id} в формате Text (.txt)")
+    await call.answer()
 
 @dp.message(F.text == "➕ Новый чат")
 async def handle_new_chat(message: types.Message):
+    if await is_user_banned(message.from_user.id):
+        await message.answer("⛔ Вы заблокированы в системе.")
+        return
+    await track_user(message.from_user)
     async with db_pool.acquire() as conn:
         new_id = await conn.fetchval(
             "INSERT INTO chats (user_id, title) VALUES ($1, $2) RETURNING id",
@@ -451,11 +521,13 @@ async def handle_new_chat(message: types.Message):
             "ON CONFLICT (user_id) DO UPDATE SET active_chat_id = $2",
             message.from_user.id, new_id
         )
-
     await message.answer(f"🆕 Создан новый чат **№{new_id}**. Начните диалог!", parse_mode=ParseMode.MARKDOWN)
 
 @dp.message(F.text == "🖨️ История чатов")
 async def handle_history_menu(message: types.Message):
+    if await is_user_banned(message.from_user.id):
+        return
+    await track_user(message.from_user)
     chats = await get_user_chats(message.from_user.id)
     if not chats:
         await message.answer("У вас пока нет созданных чатов. Напишите сообщение, чтобы создать диалог.")
@@ -476,7 +548,7 @@ async def handle_chat_manage(call: CallbackQuery):
     chat_id = int(call.data.split(":")[1])
     title = await get_chat_title(chat_id)
     await call.message.edit_text(
-        f"⚙️ Управление чатом:\n📌 {title} (ID: {chat_id})",
+        f"⚙️ **Управление чатом:**\n📌 *{title}* (ID: `{chat_id}`)",
         reply_markup=get_chat_actions_keyboard(chat_id),
         parse_mode=ParseMode.MARKDOWN
     )
@@ -499,7 +571,7 @@ async def handle_chat_select(call: CallbackQuery):
     chat_id = int(call.data.split(":")[1])
     await set_active_chat(call.from_user.id, chat_id)
     title = await get_chat_title(chat_id)
-    await call.message.edit_text(f"✅ Активный диалог переключен на: {title}.\nВы можете продолжить общение!", parse_mode=ParseMode.MARKDOWN)
+    await call.message.edit_text(f"✅ Активный диалог переключен на: *{title}*.\nВы можете продолжить общение!", parse_mode=ParseMode.MARKDOWN)
 
 @dp.callback_query(F.data.startswith("chat_delete:"))
 async def handle_chat_delete(call: CallbackQuery):
@@ -520,12 +592,500 @@ async def handle_chat_rename_input(message: types.Message, state: FSMContext):
     data = await state.get_data()
     chat_id = data.get("rename_chat_id")
     new_title = message.text.strip()[:60]
-
     if chat_id:  
         await rename_chat_db(chat_id, new_title)  
-        await message.answer(f"✅ Название чата успешно изменено на: **{new_title}**", parse_mode=ParseMode.MARKDOWN)  
-      
+        await message.answer(f"✅ Название чата изменено на: **{new_title}**", parse_mode=ParseMode.MARKDOWN)  
     await state.clear()
+
+# ─── Профиль и Промокоды (Пользователь) ───
+
+@dp.message(F.text == "👤 Мой профиль")
+async def handle_user_profile(message: types.Message):
+    if await is_user_banned(message.from_user.id):
+        return
+    await track_user(message.from_user)
+    async with db_pool.acquire() as conn:
+        u = await conn.fetchrow("SELECT balance, created_at FROM users WHERE user_id = $1", message.from_user.id)
+        chat_count = await conn.fetchval("SELECT count(*) FROM chats WHERE user_id = $1", message.from_user.id)
+        req_count = await conn.fetchval("SELECT count(*) FROM activity_logs WHERE user_id = $1", message.from_user.id)
+    
+    balance = u["balance"] if u else 0
+    reg_date = u["created_at"].strftime("%Y-%m-%d %H:%M") if u and u["created_at"] else "Неизвестно"
+    
+    profile_text = (
+        f"👤 **Ваш профиль:**\n\n"
+        f"🆔 **ID:** `{message.from_user.id}`\n"
+        f"💰 **Баланс:** `{balance}` баллов\n"
+        f"💬 **Всего чатов:** {chat_count}\n"
+        f"⚡ **Всего запросов:** {req_count}\n"
+        f"📅 **Дата регистрации:** {reg_date}"
+    )
+    await message.answer(profile_text, parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(F.text == "🎁 Промокод")
+async def handle_enter_promo_btn(message: types.Message, state: FSMContext):
+    if await is_user_banned(message.from_user.id):
+        return
+    await track_user(message.from_user)
+    await state.set_state(UserStates.waiting_for_promo_code)
+    await message.answer("🎁 Введите промокод для активации бонуса:")
+
+@dp.message(StateFilter(UserStates.waiting_for_promo_code))
+async def handle_promo_activation(message: types.Message, state: FSMContext):
+    code_text = message.text.strip().upper()
+    user_id = message.from_user.id
+
+    async with db_pool.acquire() as conn:
+        promo = await conn.fetchrow("""
+            SELECT code, reward, max_activations, used_count, expires_at 
+            FROM promocodes 
+            WHERE code = $1
+        """, code_text)
+
+        if not promo:
+            await message.answer("❌ Промокод не найден или был удален.")
+            await state.clear()
+            return
+
+        if promo["expires_at"] and promo["expires_at"] < datetime.now():
+            await conn.execute("DELETE FROM promocodes WHERE code = $1", code_text)
+            await message.answer("⌛ Срок действия данного промокода истек!")
+            await state.clear()
+            return
+
+        if promo["used_count"] >= promo["max_activations"]:
+            await message.answer("🚫 Этот промокод уже исчерпал лимит активаций.")
+            await state.clear()
+            return
+
+        already_used = await conn.fetchval(
+            "SELECT 1 FROM promocode_activations WHERE code = $1 AND user_id = $2",
+            code_text, user_id
+        )
+        if already_used:
+            await message.answer("⚠️ Вы уже активировали этот промокод ранее!")
+            await state.clear()
+            return
+
+        # Начисляем баланс
+        async with conn.transaction():
+            await conn.execute("INSERT INTO promocode_activations (code, user_id) VALUES ($1, $2)", code_text, user_id)
+            await conn.execute("UPDATE promocodes SET used_count = used_count + 1 WHERE code = $1", code_text)
+            await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", promo["reward"], user_id)
+
+    await message.answer(f"🎉 Промокод успешно активирован! Вам начислено: **+{promo['reward']}** баллов.", parse_mode=ParseMode.MARKDOWN)
+    await state.clear()
+
+# ─── Админ-панель (ID: 5480751648) ───
+
+@dp.message(Command("admin"))
+@dp.message(F.text == "⚡ Админ панель")
+async def cmd_admin(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer(
+        "🛠 **Панель управления администратора**\nВыберите нужный раздел:",
+        reply_markup=get_admin_main_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+@dp.callback_query(F.data == "admin_close")
+async def handle_admin_close(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await call.message.delete()
+
+# 1. Метрики аудитории
+@dp.callback_query(F.data == "admin_metrics_audience")
+async def handle_admin_metrics_audience(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    async with db_pool.acquire() as conn:
+        total = await conn.fetchval("SELECT count(*) FROM users")
+        new_24h = await conn.fetchval("SELECT count(*) FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'")
+        new_7d = await conn.fetchval("SELECT count(*) FROM users WHERE created_at >= NOW() - INTERVAL '7 days'")
+        new_30d = await conn.fetchval("SELECT count(*) FROM users WHERE created_at >= NOW() - INTERVAL '30 days'")
+        dau = await conn.fetchval("SELECT count(*) FROM users WHERE last_activity >= NOW() - INTERVAL '24 hours'")
+        banned = await conn.fetchval("SELECT count(*) FROM users WHERE is_banned = TRUE")
+        blocked = await conn.fetchval("SELECT count(*) FROM users WHERE is_blocked = TRUE")
+
+    text = (
+        "📊 **Метрики аудитории:**\n\n"
+        f"👥 **Всего пользователей:** `{total}`\n"
+        f"🟢 **DAU (активные за 24ч):** `{dau}`\n\n"
+        f"📈 **Новые пользователи:**\n"
+        f" ├ За 24 часа: `+{new_24h}`\n"
+        f" ├ За 7 дней: `+{new_7d}`\n"
+        f" └ За 30 дней: `+{new_30d}`\n\n"
+        f"🚫 **Заблокированы администратором:** `{banned}`\n"
+        f"🔕 **Заблокировали бота:** `{blocked}`"
+    )
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад в админку", callback_data="admin_back_main")]])
+    await call.message.edit_text(text, reply_markup=back_kb, parse_mode=ParseMode.MARKDOWN)
+
+# 2. Метрики активности
+@dp.callback_query(F.data == "admin_metrics_activity")
+async def handle_admin_metrics_activity(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    async with db_pool.acquire() as conn:
+        total_reqs = await conn.fetchval("SELECT count(*) FROM activity_logs")
+        rows = await conn.fetch("SELECT content_type, count(*) as cnt FROM activity_logs GROUP BY content_type")
+        types_map = {r["content_type"]: r["cnt"] for r in rows}
+
+    text = (
+        "📈 **Метрики активности бота:**\n\n"
+        f"⚡ **Всего обработано запросов:** `{total_reqs}`\n\n"
+        f"📦 **Распределение по типам:**\n"
+        f" ├ 📝 Текст: `{types_map.get('text', 0)}`\n"
+        f" ├ 🖼️ Фото / Изображения: `{types_map.get('photo', 0)}`\n"
+        f" ├ 📄 Документы и Архивы: `{types_map.get('document', 0)}`\n"
+        f" └ 🎙️ Аудио / Голосовые: `{types_map.get('audio', 0)}`"
+    )
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад в админку", callback_data="admin_back_main")]])
+    await call.message.edit_text(text, reply_markup=back_kb, parse_mode=ParseMode.MARKDOWN)
+
+@dp.callback_query(F.data == "admin_back_main")
+async def handle_admin_back_main(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    await call.message.edit_text(
+        "🛠 **Панель управления администратора**\nВыберите нужный раздел:",
+        reply_markup=get_admin_main_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# 3. CRM / Поиск пользователей
+@dp.callback_query(F.data == "admin_user_search")
+async def handle_admin_user_search_prompt(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_user_query)
+    await call.message.edit_text(
+        "🔍 Введите **user_id** или **@username** для поиска:",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+@dp.message(StateFilter(AdminStates.waiting_for_user_query))
+async def handle_admin_user_search_exec(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    q = message.text.strip().replace("@", "")
+    async with db_pool.acquire() as conn:
+        if q.isdigit():
+            user = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", int(q))
+        else:
+            user = await conn.fetchrow("SELECT * FROM users WHERE LOWER(username) = LOWER($1)", q)
+
+    if not user:
+        await message.answer("❌ Пользователь не найден в базе данных.")
+        await state.clear()
+        return
+
+    uid = user["user_id"]
+    async with db_pool.acquire() as conn:
+        chats = await conn.fetch("SELECT id, title FROM chats WHERE user_id = $1 ORDER BY id DESC LIMIT 5", uid)
+        req_count = await conn.fetchval("SELECT count(*) FROM activity_logs WHERE user_id = $1", uid)
+
+    chats_list_str = "\n".join([f" • ID {c['id']}: {c['title']}" for c in chats]) if chats else "Нет чатов"
+    ban_status = "🔴 Заблокирован" if user["is_banned"] else "🟢 Активен"
+    
+    card = (
+        f"👤 **Карточка пользователя:**\n\n"
+        f"🆔 **ID:** `{uid}`\n"
+        f"👤 **Username:** @{user['username'] or 'нет'}\n"
+        f"📛 **Имя:** {user['first_name']}\n"
+        f"💰 **Баланс:** `{user['balance']}`\n"
+        f"Статус: **{ban_status}**\n"
+        f"📅 **Регистрация:** {user['created_at'].strftime('%Y-%m-%d %H:%M')}\n"
+        f"⚡ **Последняя активность:** {user['last_activity'].strftime('%Y-%m-%d %H:%M')}\n"
+        f"📊 **Всего запросов:** `{req_count}`\n\n"
+        f"💬 **Последние диалоги:**\n{chats_list_str}"
+    )
+
+    ban_btn_text = "✅ Разбанить" if user["is_banned"] else "🚫 Забанить"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=ban_btn_text, callback_data=f"admin_toggle_ban:{uid}")],
+            [InlineKeyboardButton(text="🧹 Сбросить контекст/сессию", callback_data=f"admin_reset_session:{uid}")],
+            [InlineKeyboardButton(text="🗑️ Удалить все диалоги", callback_data=f"admin_clear_chats:{uid}")],
+            [InlineKeyboardButton(text="◀️ Меню админки", callback_data="admin_back_main")]
+        ]
+    )
+    await message.answer(card, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("admin_toggle_ban:"))
+async def handle_admin_toggle_ban(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    uid = int(call.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        current = await conn.fetchval("SELECT is_banned FROM users WHERE user_id = $1", uid)
+        new_val = not current
+        await conn.execute("UPDATE users SET is_banned = $1 WHERE user_id = $2", new_val, uid)
+    
+    await call.answer(f"Статус бана изменен на: {'Забанен' if new_val else 'Разбанен'}", show_alert=True)
+    await handle_admin_back_main(call, None)
+
+@dp.callback_query(F.data.startswith("admin_reset_session:"))
+async def handle_admin_reset_session(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    uid = int(call.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM active_sessions WHERE user_id = $1", uid)
+    await call.answer("Сессия и активный контекст пользователя сброшены!", show_alert=True)
+
+@dp.callback_query(F.data.startswith("admin_clear_chats:"))
+async def handle_admin_clear_chats(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+    uid = int(call.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM chats WHERE user_id = $1", uid)
+        await conn.execute("DELETE FROM active_sessions WHERE user_id = $1", uid)
+    await call.answer("Все чаты пользователя полностью удалены!", show_alert=True)
+
+# 4. Генератор промокодов
+@dp.callback_query(F.data == "admin_create_promo")
+async def handle_admin_create_promo_step1(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_promo_reward)
+    await call.message.edit_text("🎁 **Шаг 1/3:** Введите количество бонусных баллов за активацию:")
+
+@dp.message(StateFilter(AdminStates.waiting_for_promo_reward))
+async def handle_admin_create_promo_step2(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        reward = float(message.text.strip().replace(",", "."))
+    except ValueError:
+        await message.answer("⚠️ Введите корректное число для баланса:")
+        return
+    await state.update_data(promo_reward=reward)
+    await state.set_state(AdminStates.waiting_for_promo_activations)
+    await message.answer("👥 **Шаг 2/3:** Введите максимальное число активаций (например: 10):")
+
+@dp.message(StateFilter(AdminStates.waiting_for_promo_activations))
+async def handle_admin_create_promo_step3(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        activations = int(message.text.strip())
+    except ValueError:
+        await message.answer("⚠️ Введите целое число активаций:")
+        return
+    await state.update_data(promo_activations=activations)
+    await state.set_state(AdminStates.waiting_for_promo_duration)
+    await message.answer("⏱ **Шаг 3/3:** Введите время жизни промокода в минутах (0 — бессрочно):")
+
+@dp.message(StateFilter(AdminStates.waiting_for_promo_duration))
+async def handle_admin_create_promo_finish(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        duration_minutes = int(message.text.strip())
+    except ValueError:
+        await message.answer("⚠️ Введите число минут (0 — бессрочно):")
+        return
+
+    data = await state.get_data()
+    reward = data["promo_reward"]
+    activations = data["promo_activations"]
+    code = f"EVO-{secrets.token_hex(3).upper()}"
+    expires_at = datetime.now() + timedelta(minutes=duration_minutes) if duration_minutes > 0 else None
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO promocodes (code, reward, max_activations, expires_at)
+            VALUES ($1, $2, $3, $4)
+        """, code, reward, activations, expires_at)
+
+    exp_str = expires_at.strftime('%Y-%m-%d %H:%M') if expires_at else "Бессрочно"
+    res_text = (
+        f"✅ **Промокод успешно создан!**\n\n"
+        f"🔑 **Код:** `{code}`\n"
+        f"💰 **Бонус:** `{reward}` баллов\n"
+        f"👥 **Лимит активаций:** `{activations}`\n"
+        f"⌛ **Действителен до:** `{exp_str}`"
+    )
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ В панель", callback_data="admin_back_main")]])
+    await message.answer(res_text, reply_markup=back_kb, parse_mode=ParseMode.MARKDOWN)
+    await state.clear()
+
+# 5. Система Рассылки сообщений
+@dp.callback_query(F.data == "admin_broadcast_start")
+async def handle_broadcast_step1(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Всем пользователям", callback_data="broad_target:all")],
+            [InlineKeyboardButton(text="⏱ Активным за 1 день", callback_data="broad_target:1"),
+             InlineKeyboardButton(text="⏱ Активным за 7 дней", callback_data="broad_target:7")],
+            [InlineKeyboardButton(text="⏱ Активным за 30 дней", callback_data="broad_target:30")],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="admin_back_main")]
+        ]
+    )
+    await call.message.edit_text("🎯 **Выберите аудиторию для рассылки:**", reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+
+@dp.callback_query(F.data.startswith("broad_target:"))
+async def handle_broadcast_step2(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+    target = call.data.split(":")[1]
+    await state.update_data(broadcast_target=target)
+    await state.set_state(AdminStates.waiting_for_broadcast_content)
+    await call.message.edit_text(
+        "📝 **Отправьте сообщение для рассылки.**\n"
+        "Поддерживается: *текст, фото с описанием или видео с описанием.*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+@dp.message(StateFilter(AdminStates.waiting_for_broadcast_content))
+async def handle_broadcast_step3(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    content_data = {
+        "text": message.html_text if message.text else message.caption,
+        "photo": message.photo[-1].file_id if message.photo else None,
+        "video": message.video.file_id if message.video else None,
+    }
+    await state.update_data(broadcast_payload=content_data)
+    await state.set_state(AdminStates.waiting_for_broadcast_buttons)
+    
+    await message.answer(
+        "🔘 **Добавить Inline-кнопку?**\n"
+        "Отправьте в формате: `Текст кнопки | https://ссылка`\n"
+        "Или отправьте `0` / `пропустить`, если кнопка не нужна.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+@dp.message(StateFilter(AdminStates.waiting_for_broadcast_buttons))
+async def handle_broadcast_execute(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    data = await state.get_data()
+    payload = data["broadcast_payload"]
+    target = data["broadcast_target"]
+    
+    reply_markup = None
+    btn_text = message.text.strip()
+    if btn_text not in ["0", "пропустить", "нет", "none"]:
+        if "|" in btn_text:
+            title, url = btn_text.split("|", 1)
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=title.strip(), url=url.strip())]])
+
+    # Выборка получателей
+    async with db_pool.acquire() as conn:
+        if target == "all":
+            rows = await conn.fetch("SELECT user_id FROM users WHERE is_banned = FALSE AND is_blocked = FALSE")
+        else:
+            days = int(target)
+            rows = await conn.fetch("""
+                SELECT user_id FROM users 
+                WHERE is_banned = FALSE AND is_blocked = FALSE 
+                AND last_activity >= NOW() - ($1 || ' days')::INTERVAL
+            """, str(days))
+
+    user_ids = [r["user_id"] for r in rows]
+    total = len(user_ids)
+    
+    status_msg = await message.answer(f"🚀 Запуск рассылки на {total} получателей...")
+    
+    success, blocked, failed = 0, 0, 0
+    # Пакетная отправка: 25 сообщений/сек
+    for i, uid in enumerate(user_ids):
+        try:
+            if payload["photo"]:
+                await bot.send_photo(chat_id=uid, photo=payload["photo"], caption=payload["text"], parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            elif payload["video"]:
+                await bot.send_video(chat_id=uid, video=payload["video"], caption=payload["text"], parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            else:
+                await bot.send_message(chat_id=uid, text=payload["text"], parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            success += 1
+        except TelegramForbiddenError:
+            blocked += 1
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET is_blocked = TRUE WHERE user_id = $1", uid)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            failed += 1
+        except Exception:
+            failed += 1
+
+        if (i + 1) % 25 == 0:
+            await asyncio.sleep(1.0)
+        else:
+            await asyncio.sleep(0.04)
+
+    report = (
+        f"📊 **Отчет о рассылке:**\n\n"
+        f"👥 Получателей в выборке: `{total}`\n"
+        f"✅ Успешно доставлено: `{success}`\n"
+        f"🔕 Заблокировали бота: `{blocked}`\n"
+        f"❌ Ошибок отправки: `{failed}`"
+    )
+    await status_msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
+    await state.clear()
+
+# ─── Обработка подписки и /start ───
+
+@dp.callback_query(F.data == "verify_subscription")
+async def verify_sub_callback(call: CallbackQuery):
+    is_sub = await check_subscription_status(call.from_user.id)
+    if is_sub:
+        await track_user(call.from_user)
+        await call.message.delete()
+        await call.message.answer(
+            "🎉 Спасибо за подписку! Доступ к Evo Lumen 1.0 разблокирован.",
+            reply_markup=get_main_reply_keyboard(call.from_user.id == ADMIN_ID),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await call.answer("❌ Вы еще не подписались на канал!", show_alert=True)
+
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    if await is_user_banned(message.from_user.id):
+        await message.answer("⛔ Вы заблокированы в системе.")
+        return
+
+    await track_user(message.from_user)
+    is_sub = await check_subscription_status(message.from_user.id)
+    if not is_sub:
+        await message.answer(
+            "🔒 Для использования бота необходимо подписаться на наш официальный канал!\n\n"
+            "Подпишитесь и нажмите кнопку «Подтвердить подписку» ниже.",
+            reply_markup=get_sub_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    await get_or_create_active_chat(message.from_user.id)  
+    greeting = (  
+        "👋 Здравствуйте! Я **Evo Lumen 1.0** — искусственный интеллект, "  
+        "разработанный компанией **Quantum**.\n\n"  
+        "✨ **Возможности:**\n"  
+        "• Мгновенные ответы и решение задач\n"  
+        "• Проектирование и аудит сложного программного кода\n"  
+        "• Анализ голосовых сообщений и аудио\n"  
+        "• Чтение документов (PDF, DOCX, EPUB, FB2, TXT, ZIP)\n"  
+        "• Экспорт всей истории чата в файлы `.md` или `.txt`\n"  
+        "• Анализ содержимого веб-страниц по URL-ссылкам\n"  
+        "• Выгрузка любого сгенерированного кода в файлы нужного формата\n"  
+        "• Система промокодов и сохранение сессий в БД"  
+    )  
+    await message.answer(
+        greeting, 
+        reply_markup=get_main_reply_keyboard(message.from_user.id == ADMIN_ID), 
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 # ─── Вспомогательные функции: URL и Аудио ───
 
@@ -533,7 +1093,6 @@ async def extract_urls_content(text: str) -> str:
     urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
     if not urls:
         return ""
-    
     extracted_pages = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as session:
@@ -550,7 +1109,6 @@ async def extract_urls_content(text: str) -> str:
                         extracted_pages.append(f"🌐 Содержимое страницы ({url}):\n{text_data}")
             except Exception as e:
                 extracted_pages.append(f"🌐 [Не удалось загрузить {url}: {str(e)}]")
-    
     return "\n\n" + "\n\n".join(extracted_pages) if extracted_pages else ""
 
 async def transcribe_audio_file(file_id: str) -> str:
@@ -566,20 +1124,23 @@ async def transcribe_audio_file(file_id: str) -> str:
     except Exception as e:
         return f"[Ошибка распознавания аудио: {str(e)}]"
 
-# ─── Обработка файлов, документов и изображений ───
+# ─── Извлечение контента из сообщений ───
 
-async def extract_content_from_message(message: types.Message) -> tuple[str, list]:
+async def extract_content_from_message(message: types.Message) -> tuple[str, list, str]:
     text_content = message.caption or message.text or ""
     image_payloads = []
+    content_type = "text"
 
     if message.voice:
+        content_type = "audio"
         transcription = await transcribe_audio_file(message.voice.file_id)
         text_content = f"{text_content}\n\n🎙 Голосовое сообщение: {transcription}" if text_content else transcription
     elif message.audio:
+        content_type = "audio"
         transcription = await transcribe_audio_file(message.audio.file_id)
         text_content = f"{text_content}\n\n🎙 Аудиозапись: {transcription}" if text_content else transcription
-
     elif message.photo:  
+        content_type = "photo"
         photo = message.photo[-1]  
         file_io = io.BytesIO()  
         await bot.download(photo.file_id, destination=file_io)  
@@ -587,8 +1148,8 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
         image_payloads.append(b64_img)  
         if not text_content:  
             text_content = "Проанализируй прикрепленное изображение."  
-
     elif message.document:  
+        content_type = "document"
         doc = message.document  
         file_io = io.BytesIO()  
         await bot.download(doc.file_id, destination=file_io)  
@@ -612,21 +1173,15 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
                     text_content = f"{text_content}\n\n{archive_info}" if text_content else archive_info  
             except Exception as e:  
                 text_content = f"{text_content}\n\n[Ошибка распаковки архива {file_name}: {str(e)}]"  
-
         elif lower_name.endswith(".pdf"):
             try:
                 reader = PdfReader(io.BytesIO(file_bytes))
-                pdf_texts = []
-                for page in reader.pages[:40]:
-                    extracted = page.extract_text()
-                    if extracted:
-                        pdf_texts.append(extracted)
+                pdf_texts = [p.extract_text() for p in reader.pages[:40] if p.extract_text()]
                 pdf_combined = "\n".join(pdf_texts)[:15000]
                 info = f"📄 Документ PDF ({file_name}):\n{pdf_combined}"
                 text_content = f"{text_content}\n\n{info}" if text_content else info
             except Exception as e:
                 text_content = f"{text_content}\n\n[Ошибка чтения PDF {file_name}: {str(e)}]"
-
         elif lower_name.endswith(".docx"):
             try:
                 doc_obj = docx.Document(io.BytesIO(file_bytes))
@@ -635,7 +1190,6 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
                 text_content = f"{text_content}\n\n{info}" if text_content else info
             except Exception as e:
                 text_content = f"{text_content}\n\n[Ошибка чтения DOCX {file_name}: {str(e)}]"
-
         elif lower_name.endswith(".fb2"):
             try:
                 root = ET.fromstring(file_bytes)
@@ -644,7 +1198,6 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
                 text_content = f"{text_content}\n\n{info}" if text_content else info
             except Exception as e:
                 text_content = f"{text_content}\n\n[Ошибка чтения FB2 {file_name}: {str(e)}]"
-
         elif lower_name.endswith(".epub"):
             try:
                 with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
@@ -654,9 +1207,8 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
                             try:
                                 raw_html = z.read(item).decode('utf-8', errors='ignore')
                                 soup = BeautifulSoup(raw_html, 'html.parser')
-                                clean_text = soup.get_text()
-                                if clean_text.strip():
-                                    epub_texts.append(clean_text)
+                                if soup.get_text().strip():
+                                    epub_texts.append(soup.get_text())
                             except Exception:
                                 pass
                     epub_combined = "\n".join(epub_texts)[:15000]
@@ -664,7 +1216,6 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
                     text_content = f"{text_content}\n\n{info}" if text_content else info
             except Exception as e:
                 text_content = f"{text_content}\n\n[Ошибка чтения EPUB {file_name}: {str(e)}]"
-
         else:  
             try:  
                 decoded = file_bytes.decode("utf-8")  
@@ -677,13 +1228,24 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
         if urls_info:
             text_content += urls_info
 
-    return text_content, image_payloads
+    return text_content, image_payloads, content_type
 
-# ─── Основной обработчик сообщений с ИИ ───
+# ─── Основной обработчик запросов к ИИ с защитой от флуда ───
 
 @dp.message()
 async def handle_all_prompts(message: types.Message):
-    is_sub = await check_subscription_status(message.from_user.id)
+    user_id = message.from_user.id
+    
+    # 1. Проверка бана
+    if await is_user_banned(user_id):
+        await message.answer("⛔ Вы заблокированы в системе.")
+        return
+
+    # 2. Трекинг пользователя
+    await track_user(message.from_user)
+
+    # 3. Проверка подписки
+    is_sub = await check_subscription_status(user_id)
     if not is_sub:
         await message.answer(
             "🔒 Доступ ограничен! Для продолжения диалога подпишитесь на наш канал.",
@@ -692,12 +1254,22 @@ async def handle_all_prompts(message: types.Message):
         )
         return
 
-    prompt_text, images = await extract_content_from_message(message)  
+    # 4. Защита от флуда (1 запрос в 15 секунд)
+    now = time.time()
+    last_time = user_last_request_time.get(user_id, 0)
+    if user_id != ADMIN_ID and (now - last_time) < RATE_LIMIT_SECONDS:
+        remaining = int(RATE_LIMIT_SECONDS - (now - last_time))
+        await message.answer(f"⏳ **Защита от флуда:** Пожалуйста, подождите `{remaining}` сек. перед следующим запросом.")
+        return
+
+    prompt_text, images, content_type = await extract_content_from_message(message)  
     if not prompt_text and not images:  
         return  
 
-    active_chat_id = await get_or_create_active_chat(message.from_user.id)  
+    user_last_request_time[user_id] = now
+    await log_activity(user_id, content_type)
 
+    active_chat_id = await get_or_create_active_chat(user_id)  
     await save_message(active_chat_id, "user", prompt_text)  
     history = await get_chat_messages(active_chat_id, limit=8)  
 
@@ -733,7 +1305,6 @@ async def handle_all_prompts(message: types.Message):
 
         if "[MODE: DIRECT]" in raw_flash_output:  
             final_answer = raw_flash_output.replace("[MODE: DIRECT]", "").strip()  
-
         elif "[MODE: CODE_DRAFT]" in raw_flash_output or "```" in raw_flash_output:  
             updater.set_stage("🧠 *Evo Lumen 1.0* проводит глубокий аудит кода...")  
             draft_code = raw_flash_output.replace("[MODE: CODE_DRAFT]", "").strip()  
@@ -741,9 +1312,7 @@ async def handle_all_prompts(message: types.Message):
             pro_input = f"Исходный запрос:\n{prompt_text}\n\nЧерновик решения:\n{draft_code}"  
             pro_res = await client_pro.chat.completions.create(  
                 model=MODEL_PRO,  
-                messages=[  
-                    {"role": "user", "content": pro_input}  
-                ],  
+                messages=[{"role": "user", "content": pro_input}],  
                 temperature=0.1  
             )  
             final_answer = pro_res.choices[0].message.content.strip()  
@@ -763,11 +1332,13 @@ async def handle_all_prompts(message: types.Message):
 
     await send_response(message, final_answer, user_prompt=prompt_text)
 
-# ─── Запуск бота ───
+# ─── Запуск приложения ───
 
 async def main():
     await init_db()
-    print("🚀 База данных PostgreSQL инициализирована. Evo Lumen 1.0 запущен...")
+    print("🚀 База данных PostgreSQL инициализирована.")
+    print(f"👑 Админ панель активирована для ID: {ADMIN_ID}")
+    print("🤖 Evo Lumen 1.0 запущен и готов к работе...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
