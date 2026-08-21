@@ -134,8 +134,14 @@ async def get_chat_title(chat_id: int):
 
 async def delete_chat_db(chat_id: int, user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+        await db.execute(
+            "DELETE FROM messages WHERE chat_id = ?",
+            (chat_id,)
+        )
+        await db.execute(
+            "DELETE FROM chats WHERE id = ?",
+            (chat_id,)
+        )
 
         async with db.execute(
             "SELECT active_chat_id FROM active_sessions WHERE user_id = ?",
@@ -173,12 +179,17 @@ async def save_message(chat_id: int, role: str, content: str):
 async def get_chat_messages(chat_id: int, limit: int = 10):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+            "SELECT role, content FROM messages "
+            "WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
             (chat_id, limit)
         ) as cursor:
             rows = await cursor.fetchall()
+
             return [
-                {"role": r[0], "content": r[1]}
+                {
+                    "role": r[0],
+                    "content": r[1]
+                }
                 for r in reversed(rows)
             ]
 
@@ -258,10 +269,12 @@ async def check_subscription_status(user_id: int) -> bool:
             chat_id=CHANNEL_USERNAME,
             user_id=user_id
         )
+
         return member.status not in (
             ChatMemberStatus.LEFT,
             ChatMemberStatus.KICKED
         )
+
     except Exception:
         return False
 
@@ -295,70 +308,62 @@ PRO_SYSTEM_PROMPT = IDENTITY_PROMPT + """
 1. Провести аудит решения, устранить логические ошибки, синтаксические баги и проблемы оптимизации.
 2. Использовать форматирование Telegram Markdown:
    - **Жирный шрифт** для заголовков и акцентов.
-   - _Курсив_ для пояснений и _терминов_.
-   - Обязательно помещай весь код в блоки ```язык\\nкод\\n``` (это обеспечивает копирование в Telegram по клику).
+   - _Курсив_ для пояснений и терминов.
+   - Обязательно помещай весь код в блоки ```язык\nкод\n``` (это обеспечивает копирование в Telegram по клику).
 3. Выдать готовый, безупречный код и краткое перечисление ключевых улучшений.
 """
 
 
-# ─── Извлечение текста из ответа Flash ───
-def extract_flash_text(response) -> str:
+# ─── Получение ответа Flash через streaming ───
+async def get_flash_response(messages_payload):
     """
-    Обрабатывает как стандартный OpenAI-совместимый ответ,
-    так и случай, когда Flash API возвращает обычную строку.
+    Flash API возвращает chat.completion.chunk.
+    Поэтому собираем весь ответ из streaming chunks.
+
+    Некоторые chunks могут иметь:
+        choices=[]
+
+    Такие chunks просто пропускаются.
     """
 
-    # Если API сразу вернуло строку
-    if isinstance(response, str):
-        return response.strip()
-
-    # Стандартный OpenAI-compatible ответ
-    try:
-        content = response.choices[0].message.content
-
-        if isinstance(content, str):
-            return content.strip()
-
-        if isinstance(content, list):
-            parts = []
-
-            for item in content:
-                if isinstance(item, dict):
-                    if item.get("type") == "text":
-                        parts.append(item.get("text", ""))
-                    elif "text" in item:
-                        parts.append(str(item["text"]))
-
-            return "\n".join(parts).strip()
-
-        return str(content).strip()
-
-    except (AttributeError, IndexError, TypeError):
-        pass
-
-    # Если API вернуло словарь
-    if isinstance(response, dict):
-        if "choices" in response:
-            try:
-                content = response["choices"][0]["message"]["content"]
-
-                if isinstance(content, str):
-                    return content.strip()
-
-                return str(content).strip()
-
-            except (KeyError, IndexError, TypeError):
-                pass
-
-        # Возможные нестандартные форматы ответа
-        for key in ("response", "text", "content", "output"):
-            if key in response:
-                return str(response[key]).strip()
-
-    raise ValueError(
-        f"Не удалось получить текст из ответа Flash API. "
-        f"Тип ответа: {type(response).__name__}"
+    flash_stream = await client_flash.chat.completions.create(
+        model=MODEL_FLASH,
+        messages=messages_payload,
+        temperature=0.3,
+        stream=True
     )
+
+    collected_parts = []
+
+    async for chunk in flash_stream:
+        try:
+            if not chunk.choices:
+                continue
+
+            for choice in chunk.choices:
+                delta = choice.delta
+
+                if delta is None:
+                    continue
+
+                content = getattr(delta, "content", None)
+
+                if content:
+                    collected_parts.append(content)
+
+        except Exception:
+            # Пропускаем нестандартные chunks,
+            # не прерывая сборку ответа
+            continue
+
+    result = "".join(collected_parts).strip()
+
+    if not result:
+        raise ValueError(
+            "Flash API завершил streaming без текстового ответа."
+        )
+
+    return result
 
 
 # ─── Фоновый таймер статуса ───
@@ -373,6 +378,7 @@ class StatusUpdater:
     async def _update_loop(self):
         while self.is_running:
             elapsed = int(time.time() - self.start_time)
+
             text = (
                 f"{self.stage}\n"
                 f"⏱ _Время размышления:_ *{elapsed} сек.*"
@@ -389,7 +395,9 @@ class StatusUpdater:
             await asyncio.sleep(1.5)
 
     def start(self):
-        self.task = asyncio.create_task(self._update_loop())
+        self.task = asyncio.create_task(
+            self._update_loop()
+        )
 
     def set_stage(self, new_stage: str):
         self.stage = new_stage
@@ -408,7 +416,10 @@ class StatusUpdater:
 
 async def send_response(message: types.Message, text: str):
     chunks = (
-        [text[i:i + 4000] for i in range(0, len(text), 4000)]
+        [
+            text[i:i + 4000]
+            for i in range(0, len(text), 4000)
+        ]
         if len(text) > 4000
         else [text]
     )
@@ -426,7 +437,9 @@ async def send_response(message: types.Message, text: str):
 # ─── Обработка подписки ───
 @dp.callback_query(F.data == "verify_subscription")
 async def verify_sub_callback(call: CallbackQuery):
-    is_sub = await check_subscription_status(call.from_user.id)
+    is_sub = await check_subscription_status(
+        call.from_user.id
+    )
 
     if is_sub:
         await call.message.delete()
@@ -436,6 +449,7 @@ async def verify_sub_callback(call: CallbackQuery):
             reply_markup=get_main_reply_keyboard(),
             parse_mode=ParseMode.MARKDOWN
         )
+
     else:
         await call.answer(
             "❌ Вы еще не подписались на канал!",
@@ -446,7 +460,9 @@ async def verify_sub_callback(call: CallbackQuery):
 # ─── Обработчик команды /start ───
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    is_sub = await check_subscription_status(message.from_user.id)
+    is_sub = await check_subscription_status(
+        message.from_user.id
+    )
 
     if not is_sub:
         await message.answer(
@@ -457,7 +473,9 @@ async def cmd_start(message: types.Message):
         )
         return
 
-    await get_or_create_active_chat(message.from_user.id)
+    await get_or_create_active_chat(
+        message.from_user.id
+    )
 
     greeting = (
         "👋 Здравствуйте! Я **Evo Lumen 1.0** — искусственный интеллект, "
@@ -502,11 +520,14 @@ async def handle_new_chat(message: types.Message):
 
 @dp.message(F.text == "🖨️ История чатов")
 async def handle_history_menu(message: types.Message):
-    chats = await get_user_chats(message.from_user.id)
+    chats = await get_user_chats(
+        message.from_user.id
+    )
 
     if not chats:
         await message.answer(
-            "У вас пока нет созданных чатов. Напишите сообщение, чтобы создать диалог."
+            "У вас пока нет созданных чатов. "
+            "Напишите сообщение, чтобы создать диалог."
         )
         return
 
@@ -532,7 +553,10 @@ async def handle_history_menu(message: types.Message):
 
 @dp.callback_query(F.data.startswith("chat_manage:"))
 async def handle_chat_manage(call: CallbackQuery):
-    chat_id = int(call.data.split(":")[1])
+    chat_id = int(
+        call.data.split(":")[1]
+    )
+
     title = await get_chat_title(chat_id)
 
     await call.message.edit_text(
@@ -545,7 +569,9 @@ async def handle_chat_manage(call: CallbackQuery):
 
 @dp.callback_query(F.data == "chat_list_back")
 async def handle_chat_list_back(call: CallbackQuery):
-    chats = await get_user_chats(call.from_user.id)
+    chats = await get_user_chats(
+        call.from_user.id
+    )
 
     keyboard_buttons = [
         [
@@ -569,9 +595,14 @@ async def handle_chat_list_back(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("chat_use:"))
 async def handle_chat_select(call: CallbackQuery):
-    chat_id = int(call.data.split(":")[1])
+    chat_id = int(
+        call.data.split(":")[1]
+    )
 
-    await set_active_chat(call.from_user.id, chat_id)
+    await set_active_chat(
+        call.from_user.id,
+        chat_id
+    )
 
     title = await get_chat_title(chat_id)
 
@@ -584,7 +615,9 @@ async def handle_chat_select(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("chat_delete:"))
 async def handle_chat_delete(call: CallbackQuery):
-    chat_id = int(call.data.split(":")[1])
+    chat_id = int(
+        call.data.split(":")[1]
+    )
 
     await delete_chat_db(
         chat_id,
@@ -604,7 +637,9 @@ async def handle_chat_rename_prompt(
     call: CallbackQuery,
     state: FSMContext
 ):
-    chat_id = int(call.data.split(":")[1])
+    chat_id = int(
+        call.data.split(":")[1]
+    )
 
     await state.set_state(
         ChatStates.waiting_for_chat_rename
@@ -668,7 +703,9 @@ async def extract_content_from_message(
         image_payloads.append(b64_img)
 
         if not text_content:
-            text_content = "Проанализируй прикрепленное изображение."
+            text_content = (
+                "Проанализируй прикрепленное изображение."
+            )
 
     # 2. Документы (ZIP, TXT, скрипты, JSON и другие файлы)
     elif message.document:
@@ -711,7 +748,8 @@ async def extract_content_from_message(
 
                     archive_info = (
                         f"📦 Содержимое ZIP архива ({file_name}):\n"
-                        f"Список файлов: {', '.join(file_list[:30])}\n\n"
+                        f"Список файлов: "
+                        f"{', '.join(file_list[:30])}\n\n"
                         + "\n\n".join(extracted_texts)
                     )
 
@@ -724,7 +762,8 @@ async def extract_content_from_message(
             except Exception as e:
                 text_content = (
                     f"{text_content}\n\n"
-                    f"[Ошибка распаковки архива {file_name}: {str(e)}]"
+                    f"[Ошибка распаковки архива "
+                    f"{file_name}: {str(e)}]"
                 )
 
         else:
@@ -768,7 +807,9 @@ async def handle_all_prompts(message: types.Message):
         return
 
     # Извлечение текста и медиа
-    prompt_text, images = await extract_content_from_message(message)
+    prompt_text, images = await extract_content_from_message(
+        message
+    )
 
     if not prompt_text and not images:
         return
@@ -849,18 +890,15 @@ async def handle_all_prompts(message: types.Message):
                 }
             )
 
-        # Шаг 1: Flash модуль
-        flash_res = await client_flash.chat.completions.create(
-            model=MODEL_FLASH,
-            messages=messages_payload,
-            temperature=0.3
+        # ─── Шаг 1: Flash модуль ───
+        # Flash API возвращает streaming chunks,
+        # поэтому собираем весь ответ через get_flash_response().
+        raw_flash_output = await get_flash_response(
+            messages_payload
         )
 
-        # ИСПРАВЛЕНИЕ:
-        # Flash API может вернуть строку вместо объекта с .choices
-        raw_flash_output = extract_flash_text(flash_res)
-
-        # Шаг 2: Маршрутизация (Прямой ответ или аудит в Pro)
+        # ─── Шаг 2: Маршрутизация ───
+        # Прямой ответ или аудит в Pro
         if raw_flash_output.startswith("[MODE: DIRECT]"):
 
             final_answer = raw_flash_output.replace(
@@ -868,7 +906,10 @@ async def handle_all_prompts(message: types.Message):
                 ""
             ).strip()
 
-        elif raw_flash_output.startswith("[MODE: CODE_DRAFT]") or "```" in raw_flash_output:
+        elif (
+            raw_flash_output.startswith("[MODE: CODE_DRAFT]")
+            or "```" in raw_flash_output
+        ):
 
             updater.set_stage(
                 "🧠 *Evo Lumen 1.0* проводит глубокий аудит кода..."
@@ -899,7 +940,10 @@ async def handle_all_prompts(message: types.Message):
                 temperature=0.1
             )
 
-            final_answer = pro_res.choices[0].message.content.strip()
+            # Pro оставляем без изменений
+            final_answer = (
+                pro_res.choices[0].message.content.strip()
+            )
 
         else:
             final_answer = raw_flash_output
