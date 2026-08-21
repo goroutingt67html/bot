@@ -5,8 +5,8 @@ import time
 import base64
 import zipfile
 import asyncio
-import aiosqlite
 import aiohttp
+import asyncpg
 from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
 from pypdf import PdfReader
@@ -32,17 +32,20 @@ from openai import AsyncOpenAI
 
 load_dotenv()
 
-# ─── Конфигурация токенов и ключей (из переменных окружения) ───
+# ─── Конфигурация токенов и базы ───
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 FLASH_API_KEY = os.getenv("FLASH_API_KEY", "")
 PRO_API_KEY = os.getenv("PRO_API_KEY", "")
 
+RAW_DB_URL = os.getenv("DATABASE_URL", "")
+# Railway иногда выдает префикс postgres:// вместо postgresql://
+DATABASE_URL = RAW_DB_URL.replace("postgres://", "postgresql://") if RAW_DB_URL else ""
+
 # ─── Настройки каналов и моделей ───
 
 CHANNEL_USERNAME = "@Quantum_Evo"
 CHANNEL_URL = "https://t.me/Quantum_Evo"
-DB_PATH = "bot_database.db"
 
 FLASH_BASE_URL = "https://gorouter.app/v1"
 MODEL_FLASH = "claude-opus-4-8"
@@ -58,93 +61,162 @@ dp = Dispatcher(storage=MemoryStorage())
 client_flash = AsyncOpenAI(api_key=FLASH_API_KEY, base_url=FLASH_BASE_URL)
 client_pro = AsyncOpenAI(api_key=PRO_API_KEY, base_url=PRO_BASE_URL)
 
-# ─── База Данных (aiosqlite) ───
+db_pool: asyncpg.Pool = None
+
+# ─── Словари форматов и расширений ───
+
+EXT_MAP = {
+    'python': 'py', 'py': 'py', 'питон': 'py', 'пайтон': 'py',
+    'javascript': 'js', 'js': 'js', 'node': 'js', 'джаваскрипт': 'js',
+    'typescript': 'ts', 'ts': 'ts', 'тайпскрипт': 'ts',
+    'html': 'html', 'htm': 'html', 'хтмл': 'html',
+    'css': 'css', 'цсс': 'css',
+    'json': 'json', 'джсон': 'json', 'джейсон': 'json',
+    'csv': 'csv', 'ксв': 'csv',
+    'xml': 'xml',
+    'markdown': 'md', 'md': 'md', 'маркдаун': 'md',
+    'txt': 'txt', 'text': 'txt', 'текст': 'txt', 'тхт': 'txt',
+    'c': 'c', 'си': 'c',
+    'cpp': 'cpp', 'c++': 'cpp', 'cxx': 'cpp', 'плюсы': 'cpp',
+    'csharp': 'cs', 'cs': 'cs', 'c#': 'cs', 'сишарп': 'cs',
+    'java': 'java', 'джава': 'java', 'ява': 'java',
+    'kotlin': 'kt', 'kt': 'kt', 'котлин': 'kt',
+    'swift': 'swift', 'свифт': 'swift',
+    'go': 'go', 'golang': 'go', 'го': 'go', 'голанг': 'go',
+    'rust': 'rs', 'rs': 'rs', 'раст': 'rs',
+    'php': 'php', 'пхп': 'php',
+    'ruby': 'rb', 'rb': 'rb', 'руби': 'rb',
+    'sql': 'sql', 'скюэль': 'sql', 'скуль': 'sql',
+    'bash': 'sh', 'sh': 'sh', 'shell': 'sh', 'zsh': 'sh', 'баш': 'sh', 'шелл': 'sh',
+    'powershell': 'ps1', 'ps1': 'ps1',
+    'yaml': 'yaml', 'yml': 'yml', 'ямл': 'yaml',
+    'toml': 'toml',
+    'ini': 'ini', 'cfg': 'cfg', 'conf': 'conf', 'env': 'env',
+    'dockerfile': 'dockerfile',
+    'bat': 'bat', 'cmd': 'cmd'
+}
+
+CODE_EXTENSIONS = {
+    'py', 'js', 'ts', 'html', 'css', 'json', 'xml', 'cpp', 'c', 'cs', 
+    'java', 'kt', 'swift', 'go', 'rs', 'php', 'rb', 'sql', 'sh', 'ps1', 
+    'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'env', 'bat', 'cmd', 'dockerfile'
+}
+
+DEFAULT_FILENAMES = {
+    'py': 'main.py',
+    'js': 'index.js',
+    'ts': 'index.ts',
+    'html': 'index.html',
+    'css': 'style.css',
+    'json': 'data.json',
+    'csv': 'data.csv',
+    'sql': 'query.sql',
+    'sh': 'script.sh',
+    'md': 'README.md',
+    'txt': 'document.txt',
+    'cpp': 'main.cpp',
+    'c': 'main.c',
+    'cs': 'Program.cs',
+    'java': 'Main.java',
+    'go': 'main.go',
+    'rs': 'main.rs',
+    'php': 'index.php',
+    'yaml': 'config.yaml',
+    'yml': 'config.yml'
+}
+
+# ─── База Данных (PostgreSQL via asyncpg) ───
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+    global db_pool
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL не задана в переменных окружения Railway!")
+    
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
         CREATE TABLE IF NOT EXISTS chats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             title TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+        );
         """)
-        await db.execute("""
+        await conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            chat_id INTEGER REFERENCES chats(id) ON DELETE CASCADE,
             role TEXT,
             content TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE
-        )
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         """)
-        await db.execute("""
+        await conn.execute("""
         CREATE TABLE IF NOT EXISTS active_sessions (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             active_chat_id INTEGER
-        )
+        );
         """)
-        await db.commit()
 
 async def get_or_create_active_chat(user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT active_chat_id FROM active_sessions WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row and row[0]:
-                return row[0]
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT active_chat_id FROM active_sessions WHERE user_id = $1", user_id)
+        if row and row["active_chat_id"]:
+            return row["active_chat_id"]
 
-        async with db.execute("INSERT INTO chats (user_id, title) VALUES (?, ?)", (user_id, "Основной диалог")) as cursor:  
-            chat_id = cursor.lastrowid  
-        await db.execute("INSERT OR REPLACE INTO active_sessions (user_id, active_chat_id) VALUES (?, ?)", (user_id, chat_id))  
-        await db.commit()  
+        chat_id = await conn.fetchval(
+            "INSERT INTO chats (user_id, title) VALUES ($1, $2) RETURNING id",
+            user_id, "Основной диалог"
+        )
+        await conn.execute(
+            "INSERT INTO active_sessions (user_id, active_chat_id) VALUES ($1, $2) "
+            "ON CONFLICT (user_id) DO UPDATE SET active_chat_id = $2",
+            user_id, chat_id
+        )
         return chat_id
 
 async def set_active_chat(user_id: int, chat_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR REPLACE INTO active_sessions (user_id, active_chat_id) VALUES (?, ?)", (user_id, chat_id))
-        await db.commit()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO active_sessions (user_id, active_chat_id) VALUES ($1, $2) "
+            "ON CONFLICT (user_id) DO UPDATE SET active_chat_id = $2",
+            user_id, chat_id
+        )
 
 async def get_user_chats(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, title FROM chats WHERE user_id = ? ORDER BY id DESC", (user_id,)) as cursor:
-            return await cursor.fetchall()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, title FROM chats WHERE user_id = $1 ORDER BY id DESC", user_id)
+        return [(r["id"], r["title"]) for r in rows]
 
 async def get_chat_title(chat_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT title FROM chats WHERE id = ?", (chat_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else "Без названия"
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT title FROM chats WHERE id = $1", chat_id)
+        return row["title"] if row else "Без названия"
 
 async def delete_chat_db(chat_id: int, user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
-        await db.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
-        async with db.execute("SELECT active_chat_id FROM active_sessions WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row and row[0] == chat_id:
-                await db.execute("DELETE FROM active_sessions WHERE user_id = ?", (user_id,))
-        await db.commit()
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM messages WHERE chat_id = $1", chat_id)
+        await conn.execute("DELETE FROM chats WHERE id = $1", chat_id)
+        row = await conn.fetchrow("SELECT active_chat_id FROM active_sessions WHERE user_id = $1", user_id)
+        if row and row["active_chat_id"] == chat_id:
+            await conn.execute("DELETE FROM active_sessions WHERE user_id = $1", user_id)
 
 async def rename_chat_db(chat_id: int, new_title: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE chats SET title = ? WHERE id = ?", (new_title, chat_id))
-        await db.commit()
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE chats SET title = $1 WHERE id = $2", new_title, chat_id)
 
 async def save_message(chat_id: int, role: str, content: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO messages (chat_id, role, content) VALUES (?, ?, ?)", (chat_id, role, content))
-        await db.commit()
+    async with db_pool.acquire() as conn:
+        await conn.execute("INSERT INTO messages (chat_id, role, content) VALUES ($1, $2, $3)", chat_id, role, content)
 
 async def get_chat_messages(chat_id: int, limit: int = 10):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
-            (chat_id, limit)
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT role, content FROM messages WHERE chat_id = $1 ORDER BY id DESC LIMIT $2",
+            chat_id, limit
+        )
+        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 # ─── FSM Состояния ───
 
@@ -223,31 +295,96 @@ class StatusUpdater:
             except asyncio.CancelledError:  
                 pass
 
-# ─── Отправка ответов (включая .txt файлы по запросу) ───
+# ─── Логика распознавания и выгрузки файлов ───
+
+def detect_file_request(user_prompt: str, ai_text: str) -> tuple[bool, str, str]:
+    prompt_lower = user_prompt.lower()
+    
+    filename_match = re.search(r'\b([a-zA-Z0-9_\-]+\.([a-zA-Z0-9]+))\b', user_prompt)
+    
+    file_intent_patterns = [
+        r'\b(файл|файла|файлом|файле|файлик|файликом)\b',
+        r'\b(скинь|отправь|выдай|выгрузи|дай|сохрани|сделай|напиши|пришли|сгенерируй).*(файл|документ|\.[a-zA-Z0-9]+)\b',
+        r'\b(файл|документ|\.[a-zA-Z0-9]+).*(скинь|отправь|выдай|выгрузи|дай|сохрани|пришли)\b',
+        r'\b(в\s+(виде|формате)\s+[a-zA-Z0-9_\-\.]+)\b',
+        r'\b(как\s+[a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)\b'
+    ]
+    has_file_intent = any(re.search(p, prompt_lower) for p in file_intent_patterns)
+    
+    if filename_match:
+        full_name = filename_match.group(1)
+        ext = filename_match.group(2).lower()
+        if ext in EXT_MAP.values() or ext in EXT_MAP:
+            return True, full_name, EXT_MAP.get(ext, ext)
+        if has_file_intent:
+            return True, full_name, ext
+
+    if not has_file_intent:
+        return False, "", ""
+
+    detected_ext = None
+    for key, ext_val in EXT_MAP.items():
+        pattern = rf'(?:\.|\b(?:формат[еа]?|расширени[еием]|виде|язык[еа]?|как|код|файлом)\s+){re.escape(key)}\b'
+        if re.search(pattern, prompt_lower):
+            detected_ext = ext_val
+            break
+        if f".{key}" in prompt_lower:
+            detected_ext = ext_val
+            break
+
+    code_blocks = re.findall(r'```([a-zA-Z0-9_+#\-\.]+)?\n([\s\S]*?)```', ai_text)
+    if not detected_ext:
+        if code_blocks and code_blocks[0][0]:
+            raw_lang = code_blocks[0][0].strip().lower()
+            detected_ext = EXT_MAP.get(raw_lang, "txt")
+        elif code_blocks:
+            detected_ext = "py" if "def " in ai_text or "import " in ai_text else "txt"
+        else:
+            detected_ext = "txt"
+
+    filename = DEFAULT_FILENAMES.get(detected_ext, f"file.{detected_ext}")
+    return True, filename, detected_ext
+
+def extract_file_content(ai_text: str, ext: str, user_prompt: str) -> str:
+    code_blocks = re.findall(r'```(?:[a-zA-Z0-9_+#\-\.]+)?\n([\s\S]*?)```', ai_text)
+    
+    # Для языков программирования отдаем ЧИСТЫЙ код без текста и маркдауна
+    if ext in CODE_EXTENSIONS:
+        if code_blocks:
+            return "\n\n".join(b.strip() for b in code_blocks)
+        else:
+            cleaned = ai_text.strip()
+            cleaned = re.sub(r'^```[a-zA-Z0-9_\-\.]*\n?', '', cleaned)
+            cleaned = re.sub(r'\n?```$', '', cleaned).strip()
+            return cleaned
+
+    if ext == 'md':
+        return ai_text.strip()
+
+    if ext == 'txt':
+        prompt_lower = user_prompt.lower()
+        if code_blocks and any(w in prompt_lower for w in ['код', 'code', 'скрипт', 'программ']):
+            return "\n\n".join(b.strip() for b in code_blocks)
+        return ai_text.strip()
+
+    if code_blocks:
+        return "\n\n".join(b.strip() for b in code_blocks)
+    return ai_text.strip()
 
 async def send_response(message: types.Message, text: str, user_prompt: str = ""):
-    file_triggers = [
-        r'\b(в\s+(виде\s+|формате\s+)?(файла?|тхт|txt))\b',
-        r'\b(файлом|текстовым\s+файлом|как\s+файл)\b',
-        r'\b(сохрани|скинь|отправь|выдай|выгрузи|дай).*(файл|тхт|txt)\b',
-        r'\b(файл|тхт|txt).*(сохрани|скинь|отправь|выдай|выгрузи|дай)\b'
-    ]
-    wants_file = any(re.search(pattern, user_prompt, re.IGNORECASE) for pattern in file_triggers)
+    wants_file, filename, ext = detect_file_request(user_prompt, text)
 
     if wants_file:
-        code_blocks = re.findall(r'```(?:\w+)?\n([\s\S]*?)```', text)
-        if code_blocks:
-            file_content = "\n\n".join(code_blocks)
-            filename = "code.txt"
-        else:
-            file_content = text
-            filename = "response.txt"
-
-        input_file = BufferedInputFile(file_content.encode("utf-8"), filename=filename)
-        try:
-            await message.answer_document(document=input_file, caption="📄 Файл по вашему запросу:")
-        except Exception:
-            pass
+        file_content = extract_file_content(text, ext, user_prompt)
+        if file_content:
+            input_file = BufferedInputFile(file_content.encode("utf-8"), filename=filename)
+            try:
+                await message.answer_document(
+                    document=input_file,
+                    caption=f"📄 Файл `{filename}` сформирован по вашему запросу:"
+                )
+            except Exception as e:
+                await message.answer(f"⚠️ Не удалось прикрепить файл `{filename}`: {str(e)}")
 
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)] if len(text) > 4000 else [text]
     for chunk in chunks:
@@ -295,9 +432,8 @@ async def cmd_start(message: types.Message):
         "• Анализ голосовых сообщений и аудио\n"  
         "• Чтение книг и файлов (PDF, DOCX, EPUB, FB2, TXT, ZIP)\n"  
         "• Анализ содержимого веб-страниц по URL-ссылкам\n"  
-        "• Выгрузка готового кода в файлы `.txt`\n"  
-        "• Распознавание изображений\n"  
-        "• Сохранение истории и переключение между диалогами"  
+        "• Выгрузка любого кода и текста в файлы нужного формата (`.py`, `.js`, `.html`, `.json`, `.md`, `.txt` и др.)\n"  
+        "• Сохранение истории в постоянной базе данных"  
     )  
     await message.answer(greeting, reply_markup=get_main_reply_keyboard(), parse_mode=ParseMode.MARKDOWN)
 
@@ -305,11 +441,16 @@ async def cmd_start(message: types.Message):
 
 @dp.message(F.text == "➕ Новый чат")
 async def handle_new_chat(message: types.Message):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("INSERT INTO chats (user_id, title) VALUES (?, ?)", (message.from_user.id, "Новый диалог")) as cursor:
-            new_id = cursor.lastrowid
-        await db.execute("INSERT OR REPLACE INTO active_sessions (user_id, active_chat_id) VALUES (?, ?)", (message.from_user.id, new_id))
-        await db.commit()
+    async with db_pool.acquire() as conn:
+        new_id = await conn.fetchval(
+            "INSERT INTO chats (user_id, title) VALUES ($1, $2) RETURNING id",
+            message.from_user.id, "Новый диалог"
+        )
+        await conn.execute(
+            "INSERT INTO active_sessions (user_id, active_chat_id) VALUES ($1, $2) "
+            "ON CONFLICT (user_id) DO UPDATE SET active_chat_id = $2",
+            message.from_user.id, new_id
+        )
 
     await message.answer(f"🆕 Создан новый чат **№{new_id}**. Начните диалог!", parse_mode=ParseMode.MARKDOWN)
 
@@ -425,13 +566,12 @@ async def transcribe_audio_file(file_id: str) -> str:
     except Exception as e:
         return f"[Ошибка распознавания аудио: {str(e)}]"
 
-# ─── Обработка файлов, архивов, изображений, голосовых и URL ───
+# ─── Обработка файлов, документов и изображений ───
 
 async def extract_content_from_message(message: types.Message) -> tuple[str, list]:
     text_content = message.caption or message.text or ""
     image_payloads = []
 
-    # Голосовые и аудиофайлы
     if message.voice:
         transcription = await transcribe_audio_file(message.voice.file_id)
         text_content = f"{text_content}\n\n🎙 Голосовое сообщение: {transcription}" if text_content else transcription
@@ -439,7 +579,6 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
         transcription = await transcribe_audio_file(message.audio.file_id)
         text_content = f"{text_content}\n\n🎙 Аудиозапись: {transcription}" if text_content else transcription
 
-    # Фотографии
     elif message.photo:  
         photo = message.photo[-1]  
         file_io = io.BytesIO()  
@@ -449,7 +588,6 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
         if not text_content:  
             text_content = "Проанализируй прикрепленное изображение."  
 
-    # Документы (PDF, DOCX, FB2, EPUB, ZIP, TXT)
     elif message.document:  
         doc = message.document  
         file_io = io.BytesIO()  
@@ -534,7 +672,6 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
             except UnicodeDecodeError:  
                 text_content = f"{text_content}\n\n📎 Получен бинарный файл `{file_name}` размером {len(file_bytes)} байт."  
 
-    # Парсинг URL ссылок в тексте сообщения
     if text_content:
         urls_info = await extract_urls_content(text_content)
         if urls_info:
@@ -542,7 +679,7 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
 
     return text_content, image_payloads
 
-# ─── Основной обработчик сообщений с ИИ-конвейером ───
+# ─── Основной обработчик сообщений с ИИ ───
 
 @dp.message()
 async def handle_all_prompts(message: types.Message):
@@ -587,7 +724,6 @@ async def handle_all_prompts(message: types.Message):
         else:  
             messages_payload.append({"role": "user", "content": prompt_text})  
 
-        # Шаг 1: Flash модуль  
         flash_res = await client_flash.chat.completions.create(  
             model=MODEL_FLASH,  
             messages=messages_payload,  
@@ -595,7 +731,6 @@ async def handle_all_prompts(message: types.Message):
         )  
         raw_flash_output = flash_res.choices[0].message.content.strip()  
 
-        # Шаг 2: Маршрутизация  
         if "[MODE: DIRECT]" in raw_flash_output:  
             final_answer = raw_flash_output.replace("[MODE: DIRECT]", "").strip()  
 
@@ -632,7 +767,7 @@ async def handle_all_prompts(message: types.Message):
 
 async def main():
     await init_db()
-    print("🚀 База данных инициализирована. Evo Lumen 1.0 (Quantum) запущен...")
+    print("🚀 База данных PostgreSQL инициализирована. Evo Lumen 1.0 запущен...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
