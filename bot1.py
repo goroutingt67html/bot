@@ -1,10 +1,16 @@
 import os
 import io
+import re
 import time
 import base64
 import zipfile
 import asyncio
 import aiosqlite
+import aiohttp
+from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
+from pypdf import PdfReader
+import docx
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types, F
@@ -217,7 +223,32 @@ class StatusUpdater:
             except asyncio.CancelledError:  
                 pass
 
-async def send_response(message: types.Message, text: str):
+# ─── Отправка ответов (включая .txt файлы по запросу) ───
+
+async def send_response(message: types.Message, text: str, user_prompt: str = ""):
+    file_triggers = [
+        r'\b(в\s+(виде\s+|формате\s+)?(файла?|тхт|txt))\b',
+        r'\b(файлом|текстовым\s+файлом|как\s+файл)\b',
+        r'\b(сохрани|скинь|отправь|выдай|выгрузи|дай).*(файл|тхт|txt)\b',
+        r'\b(файл|тхт|txt).*(сохрани|скинь|отправь|выдай|выгрузи|дай)\b'
+    ]
+    wants_file = any(re.search(pattern, user_prompt, re.IGNORECASE) for pattern in file_triggers)
+
+    if wants_file:
+        code_blocks = re.findall(r'```(?:\w+)?\n([\s\S]*?)```', text)
+        if code_blocks:
+            file_content = "\n\n".join(code_blocks)
+            filename = "code.txt"
+        else:
+            file_content = text
+            filename = "response.txt"
+
+        input_file = BufferedInputFile(file_content.encode("utf-8"), filename=filename)
+        try:
+            await message.answer_document(document=input_file, caption="📄 Файл по вашему запросу:")
+        except Exception:
+            pass
+
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)] if len(text) > 4000 else [text]
     for chunk in chunks:
         try:
@@ -261,8 +292,11 @@ async def cmd_start(message: types.Message):
         "✨ **Возможности:**\n"  
         "• Мгновенные ответы и решение задач\n"  
         "• Проектирование и аудит сложного программного кода\n"  
-        "• Анализ файлов (ZIP-архивы, TXT, скрипты, документы)\n"  
-        "• Распознавание и работа с изображениями\n"  
+        "• Анализ голосовых сообщений и аудио\n"  
+        "• Чтение книг и файлов (PDF, DOCX, EPUB, FB2, TXT, ZIP)\n"  
+        "• Анализ содержимого веб-страниц по URL-ссылкам\n"  
+        "• Выгрузка готового кода в файлы `.txt`\n"  
+        "• Распознавание изображений\n"  
         "• Сохранение истории и переключение между диалогами"  
     )  
     await message.answer(greeting, reply_markup=get_main_reply_keyboard(), parse_mode=ParseMode.MARKDOWN)
@@ -352,13 +386,61 @@ async def handle_chat_rename_input(message: types.Message, state: FSMContext):
       
     await state.clear()
 
-# ─── Обработка файлов, архивов и изображений ───
+# ─── Вспомогательные функции: URL и Аудио ───
+
+async def extract_urls_content(text: str) -> str:
+    urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
+    if not urls:
+        return ""
+    
+    extracted_pages = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as session:
+        for url in urls[:3]:
+            target_url = url if url.startswith("http") else f"http://{url}"
+            try:
+                async with session.get(target_url) as resp:
+                    if resp.status == 200:
+                        html = await resp.text(errors="ignore")
+                        soup = BeautifulSoup(html, "html.parser")
+                        for elem in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+                            elem.extract()
+                        text_data = " ".join(soup.get_text().split())[:8000]
+                        extracted_pages.append(f"🌐 Содержимое страницы ({url}):\n{text_data}")
+            except Exception as e:
+                extracted_pages.append(f"🌐 [Не удалось загрузить {url}: {str(e)}]")
+    
+    return "\n\n" + "\n\n".join(extracted_pages) if extracted_pages else ""
+
+async def transcribe_audio_file(file_id: str) -> str:
+    try:
+        file_io = io.BytesIO()
+        await bot.download(file_id, destination=file_io)
+        audio_bytes = file_io.getvalue()
+        transcription = await client_flash.audio.transcriptions.create(
+            model="whisper-1",
+            file=("audio.ogg", audio_bytes, "audio/ogg")
+        )
+        return transcription.text
+    except Exception as e:
+        return f"[Ошибка распознавания аудио: {str(e)}]"
+
+# ─── Обработка файлов, архивов, изображений, голосовых и URL ───
 
 async def extract_content_from_message(message: types.Message) -> tuple[str, list]:
     text_content = message.caption or message.text or ""
     image_payloads = []
 
-    if message.photo:  
+    # Голосовые и аудиофайлы
+    if message.voice:
+        transcription = await transcribe_audio_file(message.voice.file_id)
+        text_content = f"{text_content}\n\n🎙 Голосовое сообщение: {transcription}" if text_content else transcription
+    elif message.audio:
+        transcription = await transcribe_audio_file(message.audio.file_id)
+        text_content = f"{text_content}\n\n🎙 Аудиозапись: {transcription}" if text_content else transcription
+
+    # Фотографии
+    elif message.photo:  
         photo = message.photo[-1]  
         file_io = io.BytesIO()  
         await bot.download(photo.file_id, destination=file_io)  
@@ -367,14 +449,16 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
         if not text_content:  
             text_content = "Проанализируй прикрепленное изображение."  
 
+    # Документы (PDF, DOCX, FB2, EPUB, ZIP, TXT)
     elif message.document:  
         doc = message.document  
         file_io = io.BytesIO()  
         await bot.download(doc.file_id, destination=file_io)  
         file_bytes = file_io.getvalue()  
         file_name = doc.file_name or "file"  
+        lower_name = file_name.lower()
 
-        if file_name.lower().endswith(".zip"):  
+        if lower_name.endswith(".zip"):  
             try:  
                 with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:  
                     file_list = z.namelist()  
@@ -390,12 +474,71 @@ async def extract_content_from_message(message: types.Message) -> tuple[str, lis
                     text_content = f"{text_content}\n\n{archive_info}" if text_content else archive_info  
             except Exception as e:  
                 text_content = f"{text_content}\n\n[Ошибка распаковки архива {file_name}: {str(e)}]"  
+
+        elif lower_name.endswith(".pdf"):
+            try:
+                reader = PdfReader(io.BytesIO(file_bytes))
+                pdf_texts = []
+                for page in reader.pages[:40]:
+                    extracted = page.extract_text()
+                    if extracted:
+                        pdf_texts.append(extracted)
+                pdf_combined = "\n".join(pdf_texts)[:15000]
+                info = f"📄 Документ PDF ({file_name}):\n{pdf_combined}"
+                text_content = f"{text_content}\n\n{info}" if text_content else info
+            except Exception as e:
+                text_content = f"{text_content}\n\n[Ошибка чтения PDF {file_name}: {str(e)}]"
+
+        elif lower_name.endswith(".docx"):
+            try:
+                doc_obj = docx.Document(io.BytesIO(file_bytes))
+                doc_text = "\n".join([p.text for p in doc_obj.paragraphs if p.text])[:15000]
+                info = f"📄 Документ DOCX ({file_name}):\n{doc_text}"
+                text_content = f"{text_content}\n\n{info}" if text_content else info
+            except Exception as e:
+                text_content = f"{text_content}\n\n[Ошибка чтения DOCX {file_name}: {str(e)}]"
+
+        elif lower_name.endswith(".fb2"):
+            try:
+                root = ET.fromstring(file_bytes)
+                fb2_text = "".join(root.itertext())[:15000]
+                info = f"📚 Книга FB2 ({file_name}):\n{fb2_text}"
+                text_content = f"{text_content}\n\n{info}" if text_content else info
+            except Exception as e:
+                text_content = f"{text_content}\n\n[Ошибка чтения FB2 {file_name}: {str(e)}]"
+
+        elif lower_name.endswith(".epub"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+                    epub_texts = []
+                    for item in z.namelist():
+                        if item.lower().endswith(('.html', '.xhtml', '.htm')):
+                            try:
+                                raw_html = z.read(item).decode('utf-8', errors='ignore')
+                                soup = BeautifulSoup(raw_html, 'html.parser')
+                                clean_text = soup.get_text()
+                                if clean_text.strip():
+                                    epub_texts.append(clean_text)
+                            except Exception:
+                                pass
+                    epub_combined = "\n".join(epub_texts)[:15000]
+                    info = f"📚 Книга EPUB ({file_name}):\n{epub_combined}"
+                    text_content = f"{text_content}\n\n{info}" if text_content else info
+            except Exception as e:
+                text_content = f"{text_content}\n\n[Ошибка чтения EPUB {file_name}: {str(e)}]"
+
         else:  
             try:  
                 decoded = file_bytes.decode("utf-8")  
                 text_content = f"{text_content}\n\n📄 Файл `{file_name}`:\n```\n{decoded[:12000]}\n```"  
             except UnicodeDecodeError:  
                 text_content = f"{text_content}\n\n📎 Получен бинарный файл `{file_name}` размером {len(file_bytes)} байт."  
+
+    # Парсинг URL ссылок в тексте сообщения
+    if text_content:
+        urls_info = await extract_urls_content(text_content)
+        if urls_info:
+            text_content += urls_info
 
     return text_content, image_payloads
 
@@ -483,7 +626,7 @@ async def handle_all_prompts(message: types.Message):
         except Exception:  
             pass  
 
-    await send_response(message, final_answer)
+    await send_response(message, final_answer, user_prompt=prompt_text)
 
 # ─── Запуск бота ───
 
