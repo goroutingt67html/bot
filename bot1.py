@@ -280,6 +280,7 @@ async def init_db():
         # ── Миграции под тарифы, кредиты запросов и системные промты ──
         await conn.execute("""
         ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS balance NUMERIC DEFAULT 0,
             ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'free',
             ADD COLUMN IF NOT EXISTS plan_expires TIMESTAMP,
             ADD COLUMN IF NOT EXISTS flash_credits INT DEFAULT 0,
@@ -362,6 +363,19 @@ async def init_db():
             paid_at TIMESTAMP
         );
         """)
+        # Миграция таблицы платежей
+        await conn.execute("""
+        ALTER TABLE payments
+            ADD COLUMN IF NOT EXISTS user_id BIGINT,
+            ADD COLUMN IF NOT EXISTS provider TEXT,
+            ADD COLUMN IF NOT EXISTS external_id TEXT,
+            ADD COLUMN IF NOT EXISTS amount_usd NUMERIC DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS stars INT DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS purpose TEXT,
+            ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending',
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS paid_at TIMESTAMP;
+        """)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS purchases (
             id SERIAL PRIMARY KEY,
@@ -372,6 +386,15 @@ async def init_db():
             source TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        """)
+        await conn.execute("""
+        ALTER TABLE purchases
+            ADD COLUMN IF NOT EXISTS user_id BIGINT,
+            ADD COLUMN IF NOT EXISTS kind TEXT,
+            ADD COLUMN IF NOT EXISTS details TEXT,
+            ADD COLUMN IF NOT EXISTS amount_usd NUMERIC DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS source TEXT,
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
         """)
 
 async def track_user(user: types.User):
@@ -422,7 +445,8 @@ async def get_user_state(user_id: int) -> dict:
             plan = "free"
             expires = None
 
-        used_flash, used_pro = row["used_flash"] or 0, row["used_pro"] or 0
+        used_flash = row["used_flash"] or 0
+        used_pro = row["used_pro"] or 0
         if row["usage_date"] != date.today():
             await conn.execute(
                 "UPDATE users SET used_flash = 0, used_pro = 0, usage_date = CURRENT_DATE WHERE user_id = $1",
@@ -449,23 +473,36 @@ async def get_user_state(user_id: int) -> dict:
     }
 
 async def consume_request(user_id: int, model: str) -> tuple[bool, str]:
-    """Списывает один запрос: сначала суточная квота тарифа, затем купленные запросы."""
-    st = await get_user_state(user_id)
+    """Списывает один запрос атомарно: сначала суточная квота тарифа, затем купленные запросы."""
     if user_id == ADMIN_ID:
         return True, "admin"
 
-    quota_left = st["left_flash"] if model == "flash" else st["left_pro"]
-    credits = st["flash_credits"] if model == "flash" else st["pro_credits"]
+    st = await get_user_state(user_id)
+    cfg_quota = st["cfg"]["flash_day"] if model == "flash" else st["cfg"]["pro_day"]
+    used_col = "used_flash" if model == "flash" else "used_pro"
+    credits_col = "flash_credits" if model == "flash" else "pro_credits"
 
     async with db_pool.acquire() as conn:
-        if quota_left > 0:
-            col = "used_flash" if model == "flash" else "used_pro"
-            await conn.execute(f"UPDATE users SET {col} = {col} + 1 WHERE user_id = $1", user_id)
+        # Атомарно пробуем списать из суточной квоты
+        res_plan = await conn.fetchval(f"""
+            UPDATE users 
+            SET {used_col} = COALESCE({used_col}, 0) + 1 
+            WHERE user_id = $1 AND COALESCE({used_col}, 0) < $2
+            RETURNING {used_col}
+        """, user_id, cfg_quota)
+        if res_plan is not None:
             return True, "plan"
-        if credits > 0:
-            col = "flash_credits" if model == "flash" else "pro_credits"
-            await conn.execute(f"UPDATE users SET {col} = GREATEST({col} - 1, 0) WHERE user_id = $1", user_id)
+
+        # Атомарно пробуем списать из купленных запросов
+        res_credits = await conn.fetchval(f"""
+            UPDATE users 
+            SET {credits_col} = GREATEST(COALESCE({credits_col}, 0) - 1, 0)
+            WHERE user_id = $1 AND COALESCE({credits_col}, 0) > 0
+            RETURNING {credits_col}
+        """, user_id)
+        if res_credits is not None:
             return True, "credits"
+
     return False, "empty"
 
 async def refund_request(user_id: int, model: str, source: str):
@@ -475,15 +512,15 @@ async def refund_request(user_id: int, model: str, source: str):
     async with db_pool.acquire() as conn:
         if source == "plan":
             col = "used_flash" if model == "flash" else "used_pro"
-            await conn.execute(f"UPDATE users SET {col} = GREATEST({col} - 1, 0) WHERE user_id = $1", user_id)
+            await conn.execute(f"UPDATE users SET {col} = GREATEST(COALESCE({col}, 0) - 1, 0) WHERE user_id = $1", user_id)
         else:
             col = "flash_credits" if model == "flash" else "pro_credits"
-            await conn.execute(f"UPDATE users SET {col} = {col} + 1 WHERE user_id = $1", user_id)
+            await conn.execute(f"UPDATE users SET {col} = COALESCE({col}, 0) + 1 WHERE user_id = $1", user_id)
 
 async def add_balance(user_id: int, amount) -> Decimal:
     async with db_pool.acquire() as conn:
         new_val = await conn.fetchval(
-            "UPDATE users SET balance = balance + $1 WHERE user_id = $2 RETURNING balance",
+            "UPDATE users SET balance = COALESCE(balance, 0) + $1 WHERE user_id = $2 RETURNING balance",
             usd(amount), user_id
         )
     return usd(new_val)
@@ -493,8 +530,8 @@ async def try_charge_balance(user_id: int, amount) -> bool:
     amount = usd(amount)
     async with db_pool.acquire() as conn:
         res = await conn.fetchval("""
-            UPDATE users SET balance = balance - $1, total_spent = COALESCE(total_spent, 0) + $1
-            WHERE user_id = $2 AND balance >= $1
+            UPDATE users SET balance = COALESCE(balance, 0) - $1, total_spent = COALESCE(total_spent, 0) + $1
+            WHERE user_id = $2 AND COALESCE(balance, 0) >= $1
             RETURNING balance
         """, amount, user_id)
     return res is not None
@@ -517,7 +554,7 @@ async def grant_plan(user_id: int, plan: str, days: int):
 async def grant_requests(user_id: int, model: str, count: int):
     col = "flash_credits" if model == "flash" else "pro_credits"
     async with db_pool.acquire() as conn:
-        await conn.execute(f"UPDATE users SET {col} = {col} + $1 WHERE user_id = $2", count, user_id)
+        await conn.execute(f"UPDATE users SET {col} = COALESCE({col}, 0) + $1 WHERE user_id = $2", count, user_id)
 
 async def log_purchase(user_id: int, kind: str, details: str, amount, source: str):
     async with db_pool.acquire() as conn:
@@ -681,11 +718,29 @@ def parse_purpose(purpose: str) -> dict:
     parts = purpose.split(":")
     kind = parts[0]
     if kind == "topup":
-        return {"kind": "topup", "amount": usd(parts[1])}
+        try:
+            amt = usd(parts[1])
+        except Exception:
+            amt = Decimal("0")
+        return {"kind": "topup", "amount": amt}
     if kind == "plan":
-        return {"kind": "plan", "plan": parts[1], "period": parts[2]}
+        if len(parts) >= 3:
+            return {"kind": "plan", "plan": parts[1], "period": parts[2]}
+        return {"kind": "unknown"}
     if kind == "pack":
-        return {"kind": "pack", "model": parts[1], "count": int(parts[2])}
+        if len(parts) >= 3:
+            model = parts[1] if parts[1] in ("flash", "pro") else "flash"
+            try:
+                cnt = int(parts[2])
+            except Exception:
+                cnt = 0
+            return {"kind": "pack", "model": model, "count": cnt}
+        elif len(parts) == 2:
+            try:
+                cnt = int(parts[1])
+            except Exception:
+                cnt = 0
+            return {"kind": "pack", "model": "flash", "count": cnt}
     return {"kind": "unknown"}
 
 def purpose_title(purpose: str) -> str:
@@ -693,10 +748,11 @@ def purpose_title(purpose: str) -> str:
     if p["kind"] == "topup":
         return f"Пополнение баланса на {fmt_usd(p['amount'])}"
     if p["kind"] == "plan":
-        cfg = PLANS[p["plan"]]
-        return f"Подписка {cfg['emoji']} {cfg['title']} на {PERIODS[p['period']][0]}"
+        cfg = PLANS.get(p["plan"], PLANS["free"])
+        period_text = PERIODS.get(p["period"], ("период", 0, "price_month"))[0]
+        return f"Подписка {cfg['emoji']} {cfg['title']} на {period_text}"
     if p["kind"] == "pack":
-        model = "Flash" if p["model"] == "flash" else "Pro"
+        model = "Flash" if p.get("model") == "flash" else "Pro"
         return f"{p['count']} запросов {model}"
     return "Покупка"
 
@@ -705,14 +761,15 @@ def purpose_amount(purpose: str) -> Decimal:
     if p["kind"] == "topup":
         return usd(p["amount"])
     if p["kind"] == "plan":
-        cfg = PLANS[p["plan"]]
-        return usd(cfg[PERIODS[p["period"]][2]])
+        cfg = PLANS.get(p["plan"], PLANS["free"])
+        period_key = PERIODS.get(p["period"], ("30 дней", 30, "price_month"))[2]
+        return usd(cfg[period_key])
     if p["kind"] == "pack":
         return pack_price(p["model"], p["count"])
     return usd(0)
 
 async def deliver_purchase(user_id: int, purpose: str, source: str) -> str:
-    """Начисляет купленное. Возвращает текст подтверждения."""
+    """Начисляет купленное строго по типу покупки. Возвращает текст подтверждения."""
     p = parse_purpose(purpose)
     amount = purpose_amount(purpose)
 
@@ -736,6 +793,7 @@ async def deliver_purchase(user_id: int, purpose: str, source: str) -> str:
         )
 
     if p["kind"] == "pack":
+        # Начисляются только запросы, баланс не изменяется
         await grant_requests(user_id, p["model"], p["count"])
         await log_purchase(user_id, "pack", f"{p['model']}:{p['count']}", amount, source)
         model_name = "Flash" if p["model"] == "flash" else "Pro"
@@ -865,7 +923,8 @@ def get_payment_methods_keyboard(purpose: str, balance_enough: bool):
         rows.append([InlineKeyboardButton(text="💰 Оплатить с баланса", callback_data=f"pay:balance:{purpose}")])
     rows.append([InlineKeyboardButton(text="⭐ Telegram Stars", callback_data=f"pay:stars:{purpose}")])
     rows.append([InlineKeyboardButton(text="🪙 CryptoBot (USDT)", callback_data=f"pay:crypto:{purpose}")])
-    rows.append([InlineKeyboardButton(text="◀️ В магазин", callback_data="shop_root")])
+    rows.append([InlineKeyboardButton(text="◀️ В магазин", callback_data="shop_root")]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def get_topup_keyboard():
@@ -1547,13 +1606,33 @@ async def handle_successful_payment(message: types.Message):
         return
     purpose = payload[4:]
     user_id = message.from_user.id
+    charge_id = sp.telegram_payment_charge_id
 
     async with db_pool.acquire() as conn:
-        await conn.execute("""
+        # Защита от повторной обработки
+        already_paid = await conn.fetchval(
+            "SELECT 1 FROM payments WHERE external_id = $1 AND status = 'paid'", charge_id
+        )
+        if already_paid:
+            await message.answer("✅ Этот платёж уже был успешно обработан.")
+            return
+
+        updated = await conn.fetchval("""
             UPDATE payments SET status = 'paid', paid_at = CURRENT_TIMESTAMP,
                 external_id = $1
-            WHERE user_id = $2 AND provider = 'stars' AND purpose = $3 AND status = 'pending'
-        """, sp.telegram_payment_charge_id, user_id, purpose)
+            WHERE id = (
+                SELECT id FROM payments 
+                WHERE user_id = $2 AND provider = 'stars' AND purpose = $3 AND status = 'pending'
+                ORDER BY id DESC LIMIT 1
+            )
+            RETURNING id
+        """, charge_id, user_id, purpose)
+
+        if not updated:
+            await conn.execute("""
+                INSERT INTO payments (user_id, provider, external_id, amount_usd, stars, purpose, status, paid_at)
+                VALUES ($1, 'stars', $2, $3, $4, $5, 'paid', CURRENT_TIMESTAMP)
+            """, user_id, charge_id, purpose_amount(purpose), sp.total_amount, purpose)
 
     result = await deliver_purchase(user_id, purpose, "stars")
     await message.answer(
@@ -1839,7 +1918,7 @@ async def handle_promo_activation(message: types.Message, state: FSMContext):
             await conn.execute("INSERT INTO promocode_activations (code, user_id) VALUES ($1, $2)", code_text, user_id)
             await conn.execute("UPDATE promocodes SET used_count = used_count + 1 WHERE code = $1", code_text)
             if promo["reward"]:
-                await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", usd(promo["reward"]), user_id)
+                await conn.execute("UPDATE users SET balance = COALESCE(balance, 0) + $1 WHERE user_id = $2", usd(promo["reward"]), user_id)
 
     rewards = []
     if promo["reward"]:
@@ -2132,7 +2211,7 @@ async def handle_admin_create_promo_step1(call: CallbackQuery, state: FSMContext
     await call.message.edit_text(
         "🎁 **Шаг 1/3:** Введите содержимое промокода.\n\n"
         "Форматы:\n"
-        "• `5` — начислить $5 на баланс\n"
+        "• `5` или `$5` — начислить $5 на баланс\n"
         "• `flash:50` — 50 запросов Flash\n"
         "• `pro:20` — 20 запросов Pro\n"
         "• `plan:pro:30` — подписка Pro на 30 дней\n"
@@ -2153,12 +2232,18 @@ def parse_promo_spec(raw: str) -> dict | None:
             result["grant_plan"] = chunks[1]
             result["grant_days"] = int(chunks[2])
             ok = True
-        elif head == "flash" and len(chunks) == 2 and chunks[1].isdigit():
+        elif head in ("flash", "req", "requests") and len(chunks) == 2 and chunks[1].isdigit():
             result["grant_flash"] = int(chunks[1])
             ok = True
         elif head == "pro" and len(chunks) == 2 and chunks[1].isdigit():
             result["grant_pro"] = int(chunks[1])
             ok = True
+        elif head in ("usd", "balance", "bal") and len(chunks) == 2:
+            try:
+                result["reward"] += usd(chunks[1].replace(",", ".").lstrip("$"))
+                ok = True
+            except Exception:
+                return None
         else:
             try:
                 result["reward"] += usd(part.replace(",", ".").lstrip("$"))
@@ -2313,8 +2398,8 @@ async def handle_broadcast_execute(message: types.Message, state: FSMContext):
             rows = await conn.fetch("""
                 SELECT user_id FROM users
                 WHERE is_banned = FALSE AND is_blocked = FALSE
-                AND last_activity >= NOW() - ($1 || ' days')::INTERVAL
-            """, str(days))
+                AND last_activity >= NOW() - make_interval(days => $1::int)
+            """, days)
 
     user_ids = [r["user_id"] for r in rows]
     total = len(user_ids)
@@ -2661,8 +2746,8 @@ async def handle_all_prompts(message: types.Message):
     await log_activity(user_id, content_type)
 
     active_chat_id = await get_or_create_active_chat(user_id)
-    await save_message(active_chat_id, "user", prompt_text)
     history = await get_chat_messages(active_chat_id, limit=st["cfg"]["history"])
+    await save_message(active_chat_id, "user", prompt_text)
 
     model_label = "⚡ Flash" if model == "flash" else "🧠 Pro"
     status_msg = await message.answer(
@@ -2680,7 +2765,7 @@ async def handle_all_prompts(message: types.Message):
         if st["system_prompt"] and plan_allows_system_prompt(st["plan"]):
             messages_payload.append({"role": "system", "content": st["system_prompt"]})
 
-        for hist in history[:-1]:
+        for hist in history:
             messages_payload.append({"role": hist["role"], "content": hist["content"]})
 
         if images:
