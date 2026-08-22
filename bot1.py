@@ -21,7 +21,8 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
 from aiogram.filters import CommandStart, Command, StateFilter
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter, TelegramNetworkError
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -41,7 +42,7 @@ load_dotenv()
 
 # ─── Конфигурация токенов и базы ───
 
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip().strip('"').strip("'")
 FLASH_API_KEY = os.getenv("FLASH_API_KEY", "")
 PRO_API_KEY = os.getenv("PRO_API_KEY", "")
 
@@ -173,7 +174,8 @@ PERIODS = {"week": ("7 дней", 7, "price_week"), "month": ("30 дней", 30,
 
 # ─── Инициализация ───
 
-bot = Bot(token=TG_BOT_TOKEN)
+session = AiohttpSession(timeout=60.0)
+bot = Bot(token=TG_BOT_TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
 client_flash = AsyncOpenAI(api_key=FLASH_API_KEY, base_url=FLASH_BASE_URL)
@@ -363,7 +365,6 @@ async def init_db():
             paid_at TIMESTAMP
         );
         """)
-        # Миграция таблицы платежей
         await conn.execute("""
         ALTER TABLE payments
             ADD COLUMN IF NOT EXISTS user_id BIGINT,
@@ -483,7 +484,6 @@ async def consume_request(user_id: int, model: str) -> tuple[bool, str]:
     credits_col = "flash_credits" if model == "flash" else "pro_credits"
 
     async with db_pool.acquire() as conn:
-        # Атомарно пробуем списать из суточной квоты
         res_plan = await conn.fetchval(f"""
             UPDATE users 
             SET {used_col} = COALESCE({used_col}, 0) + 1 
@@ -493,7 +493,6 @@ async def consume_request(user_id: int, model: str) -> tuple[bool, str]:
         if res_plan is not None:
             return True, "plan"
 
-        # Атомарно пробуем списать из купленных запросов
         res_credits = await conn.fetchval(f"""
             UPDATE users 
             SET {credits_col} = GREATEST(COALESCE({credits_col}, 0) - 1, 0)
@@ -793,7 +792,6 @@ async def deliver_purchase(user_id: int, purpose: str, source: str) -> str:
         )
 
     if p["kind"] == "pack":
-        # Начисляются только запросы, баланс не изменяется
         await grant_requests(user_id, p["model"], p["count"])
         await log_purchase(user_id, "pack", f"{p['model']}:{p['count']}", amount, source)
         model_name = "Flash" if p["model"] == "flash" else "Pro"
@@ -923,8 +921,7 @@ def get_payment_methods_keyboard(purpose: str, balance_enough: bool):
         rows.append([InlineKeyboardButton(text="💰 Оплатить с баланса", callback_data=f"pay:balance:{purpose}")])
     rows.append([InlineKeyboardButton(text="⭐ Telegram Stars", callback_data=f"pay:stars:{purpose}")])
     rows.append([InlineKeyboardButton(text="🪙 CryptoBot (USDT)", callback_data=f"pay:crypto:{purpose}")])
-    rows.append([InlineKeyboardButton(text="◀️ В магазин", callback_data="shop_root")]
-    )
+    rows.append([InlineKeyboardButton(text="◀️ В магазин", callback_data="shop_root")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def get_topup_keyboard():
@@ -1563,7 +1560,7 @@ async def handle_pay_balance(call: CallbackQuery):
     )
     await call.answer("Оплачено с баланса")
 
-# ─── Оплата Telegram Stars (бот сам создаёт инвойс-чек) ───
+# ─── Оплата Telegram Stars ───
 
 @dp.callback_query(F.data.startswith("pay:stars:"))
 async def handle_pay_stars(call: CallbackQuery):
@@ -1609,7 +1606,6 @@ async def handle_successful_payment(message: types.Message):
     charge_id = sp.telegram_payment_charge_id
 
     async with db_pool.acquire() as conn:
-        # Защита от повторной обработки
         already_paid = await conn.fetchval(
             "SELECT 1 FROM payments WHERE external_id = $1 AND status = 'paid'", charge_id
         )
@@ -1705,7 +1701,6 @@ async def handle_crypto_check(call: CallbackQuery):
         await call.answer(f"Оплата не найдена (статус: {status}). Попробуйте через минуту.", show_alert=True)
         return
 
-    # Защита от двойного зачисления
     async with db_pool.acquire() as conn:
         updated = await conn.fetchval("""
             UPDATE payments SET status = 'paid', paid_at = CURRENT_TIMESTAMP
@@ -2761,7 +2756,6 @@ async def handle_all_prompts(message: types.Message):
     try:
         messages_payload = []
 
-        # Системный промт — только Pro и выше
         if st["system_prompt"] and plan_allows_system_prompt(st["plan"]):
             messages_payload.append({"role": "system", "content": st["system_prompt"]})
 
@@ -2822,8 +2816,20 @@ async def main():
     print(f"💵 Валюта: USD · Flash {PRICE_PER_REQUEST['flash']}$ · Pro {PRICE_PER_REQUEST['pro']}$")
     print(f"⭐ Курс звёзд: {STARS_PER_USD} Stars = 1$")
     print(f"🪙 CryptoBot: {'подключен' if CRYPTO_PAY_TOKEN else 'ТОКЕН НЕ ЗАДАН'}")
-    print("🤖 Evo Lumen 1.0 запущен и готов к работе...")
-    await dp.start_polling(bot)
+
+    while True:
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            me = await bot.get_me()
+            print(f"🤖 Бот @{me.username} успешно авторизован в Telegram и готов к работе!")
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            break
+        except (TelegramNetworkError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+            print(f"⚠️ Сетевая ошибка при подключении к Telegram ({e}). Повторное подключение через 5 сек...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            print(f"❌ Критическая ошибка при работе бота: {e}")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
